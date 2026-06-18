@@ -36,8 +36,7 @@ print(f"输入文件 B: {FILE_B}")
 print(f"输出目录: {OUTPUT_DIR}")
 print("")
 
-CANVAS_W = 1125
-CANVAS_H = 566
+# 画布尺寸（从源文件动态读取，见下方）
 FPS = 30
 
 # 时间轴（帧）
@@ -65,23 +64,34 @@ with open(FILE_A, 'r', encoding='utf-8') as f:
 with open(FILE_B, 'r', encoding='utf-8') as f:
     src_b = json.load(f)
 
+# 画布尺寸从源文件读取（不再硬编码）
+CANVAS_W = src_a.get('w', 1125)
+CANVAS_H = src_a.get('h', 566)
+
 # ─── 合并 assets（base64 签名去重）─────────────────────
 assets = []
 asset_map = {}  # (source_tag, original_refId) -> new_refId
 asset_sigs = {}
 
 def add_asset(asset, source_tag):
-    """添加资产，基于内容签名去重"""
+    """添加资产，基于内容签名去重（兼容图片asset和comp合成asset）"""
     if 'id' not in asset:
         return  # 跳过没有id的资产
-    
+
     w = asset.get('w', 0)
     h = asset.get('h', 0)
     p = asset.get('p', '')
-    sig = (w, h, p[:100] if p else '')
+    # comp 类型 asset 用 layers 内容做签名，图片类型用 base64 前100字符
+    if 'layers' in asset:
+        layer_count = len(asset['layers'])
+        first_layer_nm = asset['layers'][0].get('nm', '') if asset['layers'] else ''
+        sig = ('comp', w, h, layer_count, first_layer_nm)
+    else:
+        sig = ('img', w, h, p[:100] if p else '')
     
     if sig not in asset_sigs:
-        new_id = f"image_{len(assets)}"
+        prefix = 'comp' if 'layers' in asset else 'image'
+        new_id = f"{prefix}_{len(assets)}"
         new_asset = copy.deepcopy(asset)
         new_asset['id'] = new_id
         assets.append(new_asset)
@@ -112,12 +122,12 @@ def extract_layer_meta(layer, source_tag):
     
     refId = layer.get('refId', '')
     layer_type = layer.get('ty', 2)
-    
-    # 只有图像图层(ty=2)且有refId时才映射资产
+
+    # 映射 refId（支持图像图层ty=2 和 预合成图层ty=0）
     new_refid = refId
     aw, ah = 100, 100
-    
-    if layer_type == 2 and refId:
+
+    if refId and (layer_type in (0, 2)):
         if (source_tag, refId) in asset_map:
             new_refid = asset_map[(source_tag, refId)]
         # 获取 asset 原始尺寸
@@ -422,8 +432,8 @@ def make_layer(el, animated=True):
         "_source_ind": source_ind,  # 内部标记，后续 remap 后删除
     }
     
-    # 只有图像图层且有refId时才设置refId
-    if el['layer_type'] == 2 and refId:
+    # 图像图层(ty=2)和预合成图层(ty=0)都需要 refId
+    if el['layer_type'] in (0, 2) and refId:
         base["refId"] = refId
     
     if cl:

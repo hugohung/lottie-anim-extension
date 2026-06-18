@@ -1,5 +1,5 @@
 ---
-name: lottie-merge-anim
+name: 规范化Lottie动效延展
 description: 将两个静帧 Lottie JSON 合并为带切帧动效的 Lottie JSON，自动识别静态图层并生成平滑的入场/退场动画。
 trigger:
   - Lottie动效

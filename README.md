@@ -1,4 +1,4 @@
-# Lottie 静帧合并动效
+# 规范化Lottie动效延展
 
 > WorkBuddy Skill — 将两个静帧 Lottie JSON 合并为带切帧动效的 Lottie JSON，自动识别静态图层并生成平滑的入场/退场动画。
 
