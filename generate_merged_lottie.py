@@ -1,556 +1,563 @@
 """
-V4: 将两个静帧 Lottie JSON 合并为一个带切帧动效的 Lottie JSON。
+V7: 将两个静帧 Lottie JSON 合并为带切换动效的 Lottie JSON。
 
-核心改进:
-1. 精确记录每个图层的完整元数据（name, position, anchor, scale, ind）
-2. 对比识别静态图层（同名且position/anchor/scale完全相同的）= 不动效
-3. 保留源文件图层原始排序（ind）和锚点（anchor）
-4. 只对变化的图层编写入场/退场动效
-5. 图层排列：顶层静态(腰封) → Scene B前景 → Scene A前景 → 底层静态(背景)
-6. 支持命令行参数输入文件
+核心策略（V7 重写要点）:
+1. 不靠图层名称识别静态图层（lottielab/AE等工具导出后 nm 字段常为空）
+   改用 position 坐标相近 + asset base64 内容相同 双重匹配
+2. comp asset 完整复制，不做内容去重（嵌套层级太深，去重容易自引用）
+3. 只做 prefix 命名空间隔离：A 的 asset id 加 "a_" 前缀，B 的加 "b_"
+   comp 内部子层的 refId 用 BFS 迭代同步更新（不递归，避免爆栈）
+4. 版本号、帧率、画布尺寸全部读取源文件，不硬编码
+5. 时间轴基于秒定义，通过 s2f() 换算为帧数，兼容任意帧率
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+自查表（每次运行后核对）:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+□ 1. 版本号
+    输出 v 字段是否与源文件一致？（不能是 "5.6.10" 等硬编码值）
+    → 检查: print("v:", d["v"])
+
+□ 2. 帧率与时间轴
+    FPS 是否正确读取？（源文件 fr 字段，不能硬编码 30）
+    总帧数 = s2f(T_TOTAL) 是否合理？（5秒@100fps=500帧，@30fps=150帧）
+    → 检查脚本开头的 print 输出
+
+□ 3. Asset 引用完整性
+    所有图层的 refId 是否都能在 assets 中找到？
+    → 用以下命令验证:
+      python3 -c "
+      import json
+      d = json.load(open('merged_output.json'))
+      ids = {a['id'] for a in d['assets']}
+      bad = [(l.get('nm'), l.get('refId')) for l in d['layers'] if l.get('refId') and l['refId'] not in ids]
+      print('Missing:', bad if bad else 'none')
+      "
+
+□ 4. comp 内部 refId
+    comp 类 asset 的内部子层 refId 是否已更新为带前缀的 id？
+    → 检查 prefix_asset_ids() 的 BFS 更新是否正常执行
+
+□ 5. 静态图层识别
+    脚本输出的 "Static" 列表是否合理？
+    - 背景图层应该在静态列表里
+    - 只有 A/B 中内容相同且位置相同的图层才应该是静态
+    - 如果静态列表为空或过多，检查 is_same_asset() 逻辑
+
+□ 6. 方向判断阈值
+    get_direction() 的阈值是否基于画布比例？（W*0.3、H*0.75 等）
+    不能用绝对像素值（如 400、500）
+
+□ 7. 动效时长
+    FADE（透明度过渡帧数）是否合理？
+    当前 FADE=8 帧，在 100fps 下 = 0.08s，可能过短
+    如需调整，改为 s2f(0.15) 这类秒制表达更安全
+
+□ 8. JSON 合法性
+    输出文件是否可被 json.loads() 正常解析？
+    bejson.com / q-fe 工具能否正常识别？
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+用法:
+  python generate_merged_lottie.py <文件A.json> <文件B.json> [输出目录]
+
+示例:
+  python generate_merged_lottie.py scene1.json scene2.json ./output
 """
-import json
-import copy
-import os
-import sys
 
-# ─── 命令行参数 ──────────────────────────────────────
-def print_usage():
-    print("用法:")
-    print("  python generate_merged_lottie.py <文件A.json> <文件B.json> [输出目录]")
-    print("")
-    print("示例:")
-    print("  python generate_merged_lottie.py scene1.json scene2.json ./output")
-    sys.exit(1)
+import json, copy, sys, os
 
+# ── 参数 ─────────────────────────────────────────────────────────────────────
 if len(sys.argv) < 3:
-    print_usage()
+    print("用法: python generate_merged_lottie.py <文件A.json> <文件B.json> [输出目录]")
+    sys.exit(1)
 
 FILE_A = sys.argv[1]
 FILE_B = sys.argv[2]
 OUTPUT_DIR = sys.argv[3] if len(sys.argv) > 3 else os.path.dirname(os.path.abspath(__file__))
-OUTPUT = os.path.join(OUTPUT_DIR, "merged_output.json")
+OUTPUT = os.path.join(OUTPUT_DIR, 'merged_output.json')
 
 print(f"输入文件 A: {FILE_A}")
 print(f"输入文件 B: {FILE_B}")
-print(f"输出目录: {OUTPUT_DIR}")
-print("")
+print(f"输出目录: {OUTPUT_DIR}\n")
 
-# 画布尺寸 + FPS（从源文件动态读取）
+# ── 读取源文件（必须先读，后续所有参数依赖源文件）────────────────────────────
+with open(FILE_A, 'r', encoding='utf-8') as f: src_a = json.load(f)
+with open(FILE_B, 'r', encoding='utf-8') as f: src_b = json.load(f)
+
+# 自查点 1+2: 版本号/帧率/尺寸全部从源文件读取，禁止硬编码
 FPS = max(src_a.get('fr', 30), src_b.get('fr', 30))
+W   = src_a.get('w', 1125)
+H   = src_a.get('h', 600)
+V   = src_a.get('v', '5.7.5')   # ← 保留源文件版本号
 
-# 时间轴（帧）
-SCENE_A_HOLD_END     = 5
-SCENE_A_EXIT_START   = 5
-SCENE_A_EXIT_END     = 15
-SCENE_B_ENTRY_START  = 10
-SCENE_B_ENTRY_END    = 20
-SCENE_B_HOLD_END     = 90
-SCENE_B_EXIT_START   = 90
-SCENE_B_EXIT_END     = 100
-SCENE_A_ENTRY_START  = 95
-SCENE_A_ENTRY_END    = 105
-TOTAL_FRAMES         = 150
+# 自查点 2: 时间轴基于秒定义，s2f() 换算，兼容任意帧率
+def s2f(sec): return round(sec * FPS)
 
-# 缓动
-EASE_OUT   = {"x": [0.333], "y": [0]}
-EASE_IN    = {"x": [0.667], "y": [1]}
-EASE_SNAPPY_I = {"x": [0.667], "y": [0.667]}
-EASE_SNAPPY_O = {"x": [0.333], "y": [0.333]}
+T_TOTAL  = 5.0   # 总时长（秒）
+T_A_END  = 0.2   # A 静置结束
+T_AB_MID = 0.5   # A→B 切换中点
+T_B_END  = 4.0   # B 静置结束
+T_BA_MID = 4.3   # B→A 切换中点
 
-# ─── 读取源文件 ────────────────────────────────────────
-with open(FILE_A, 'r', encoding='utf-8') as f:
-    src_a = json.load(f)
-with open(FILE_B, 'r', encoding='utf-8') as f:
-    src_b = json.load(f)
+F_TOTAL     = s2f(T_TOTAL)
+F_A_EXIT_S  = s2f(T_A_END)
+F_A_EXIT_E  = s2f(T_AB_MID)
+F_B_ENTER_S = s2f((T_A_END + T_AB_MID) / 2)
+F_B_ENTER_E = s2f(T_AB_MID + 0.15)
+F_B_EXIT_S  = s2f(T_B_END)
+F_B_EXIT_E  = s2f(T_BA_MID)
+F_A_ENTER_S = s2f((T_B_END + T_BA_MID) / 2)
+F_A_ENTER_E = s2f(T_BA_MID + 0.15)
 
-# 画布尺寸从源文件读取（不再硬编码）
-CANVAS_W = src_a.get('w', 1125)
-CANVAS_H = src_a.get('h', 566)
+print(f"FPS={FPS}  v={V}  W={W}  H={H}")
+print(f"TOTAL={F_TOTAL}f ({T_TOTAL}s)")
+print(f"A exit:  {F_A_EXIT_S}→{F_A_EXIT_E}")
+print(f"B enter: {F_B_ENTER_S}→{F_B_ENTER_E}")
+print(f"B exit:  {F_B_EXIT_S}→{F_B_EXIT_E}")
+print(f"A enter: {F_A_ENTER_S}→{F_A_ENTER_E}")
 
-# ─── 合并 assets（base64 签名去重）─────────────────────
-assets = []
-asset_map = {}  # (source_tag, original_refId) -> new_refId
-asset_sigs = {}
+# ── Assets: 前缀命名空间隔离 ─────────────────────────────────────────────────
+# 自查点 3+4: 每个来源独立加前缀，comp 内部子层 refId 用 BFS 迭代同步更新
+def prefix_asset_ids(assets, prefix):
+    """给所有 asset 的 id 加前缀，并同步修改 comp asset 内部子层的 refId。
+    使用 BFS 迭代避免递归爆栈（深度嵌套 comp 会导致 RecursionError）。
+    """
+    id_map = {a['id']: prefix + a['id'] for a in assets if 'id' in a}
+    new_assets = []
+    for a in assets:
+        na = copy.deepcopy(a)
+        if 'id' in na:
+            na['id'] = id_map[a['id']]
+        # comp asset: BFS 更新直接子层的 refId
+        if 'layers' in na:
+            queue = list(na.get('layers', []))
+            visited = set()
+            while queue:
+                layer = queue.pop(0)
+                lid = id(layer)
+                if lid in visited:
+                    continue
+                visited.add(lid)
+                old_ref = layer.get('refId')
+                if old_ref and old_ref in id_map:
+                    layer['refId'] = id_map[old_ref]
+                # 注意：不继续深入子 asset 的 layers（避免自引用死循环）
+        new_assets.append(na)
+    return new_assets, id_map
 
-def add_asset(asset, source_tag):
-    """添加资产，基于内容签名去重（兼容图片asset和comp合成asset）"""
-    if 'id' not in asset:
-        return  # 跳过没有id的资产
+assets_a, id_map_a = prefix_asset_ids(src_a.get('assets', []), 'a_')
+assets_b, id_map_b = prefix_asset_ids(src_b.get('assets', []), 'b_')
+all_assets = assets_a + assets_b
+print(f"\nAssets: A={len(assets_a)} B={len(assets_b)} total={len(all_assets)}")
 
-    w = asset.get('w', 0)
-    h = asset.get('h', 0)
-    p = asset.get('p', '')
-    # comp 类型 asset 用 layers 内容做签名，图片类型用 base64 前100字符
-    if 'layers' in asset:
-        layer_count = len(asset['layers'])
-        first_layer_nm = asset['layers'][0].get('nm', '') if asset['layers'] else ''
-        sig = ('comp', w, h, layer_count, first_layer_nm)
-    else:
-        sig = ('img', w, h, p[:100] if p else '')
-    
-    if sig not in asset_sigs:
-        prefix = 'comp' if 'layers' in asset else 'image'
-        new_id = f"{prefix}_{len(assets)}"
-        new_asset = copy.deepcopy(asset)
-        new_asset['id'] = new_id
-        assets.append(new_asset)
-        asset_sigs[sig] = new_id
-        asset_map[(source_tag, asset['id'])] = new_id
-    else:
-        asset_map[(source_tag, asset['id'])] = asset_sigs[sig]
+# ── 提取图层元数据 ───────────────────────────────────────────────────────────
+def get_pos(ks_field):
+    """提取静态 position 值，返回 [x, y, z]"""
+    k = ks_field.get('k', [0, 0, 0])
+    if isinstance(k, list) and len(k) >= 2 and not isinstance(k[0], dict):
+        return [k[0], k[1], k[2] if len(k) > 2 else 0]
+    return [0, 0, 0]
 
-# 只处理有id的asset
-for a in src_a.get('assets', []):
-    if 'id' in a:
-        add_asset(a, 'a')
-for a in src_b.get('assets', []):
-    if 'id' in a:
-        add_asset(a, 'b')
+def get_scalar(ks_field, default=100):
+    k = ks_field.get('k', default)
+    if isinstance(k, (int, float)):
+        return k
+    if isinstance(k, list) and len(k) > 0 and isinstance(k[0], (int, float)):
+        return k[0]
+    return default
 
-print(f"Total unique assets: {len(assets)}")
+def get_scale(ks_field):
+    k = ks_field.get('k', [100, 100, 100])
+    if isinstance(k, list) and len(k) >= 2 and not isinstance(k[0], dict):
+        return [k[0], k[1], k[2] if len(k) > 2 else 100]
+    return [100, 100, 100]
 
-# ─── 提取完整图层元数据 ────────────────────────────────
-def extract_layer_meta(layer, source_tag):
-    """提取图层的所有关键元数据，用于比对和重建"""
+def extract_layer(layer, id_map):
+    """从源图层提取元数据，refId 使用已加前缀的新 id"""
     ks = layer.get('ks', {})
-    p = ks.get('p', {}).get('k', [0, 0, 0])  # position
-    a = ks.get('a', {}).get('k', [0, 0, 0])  # anchor
-    s = ks.get('s', {}).get('k', [100, 100, 100])  # scale
-    o = ks.get('o', {}).get('k', 100)  # opacity
-    r = ks.get('r', {}).get('k', 0)  # rotation
-    
-    refId = layer.get('refId', '')
-    layer_type = layer.get('ty', 2)
-
-    # 提取图层类型特有的字段
-    shapes = layer.get('shapes') if layer_type == 4 else None   # ty=4 形状层
-    lw = layer.get('w')                                          # ty=0 预合成层宽高
-    lh = layer.get('h')
-
-    # 映射 refId（支持图像图层ty=2 和 预合成图层ty=0）
-    new_refid = refId
-    aw, ah = 100, 100
-
-    if refId and (layer_type in (0, 2)):
-        if (source_tag, refId) in asset_map:
-            new_refid = asset_map[(source_tag, refId)]
-        # 获取 asset 原始尺寸
-        for asset in (src_a['assets'] if source_tag == 'a' else src_b['assets']):
-            if asset['id'] == refId:
-                aw, ah = asset.get('w', 100), asset.get('h', 100)
-                break
-    
+    pos = get_pos(ks.get('p', {}))
+    anc = get_pos(ks.get('a', {}))
+    scl = get_scale(ks.get('s', {}))
+    rot = get_scalar(ks.get('r', {}), 0)
+    opa = get_scalar(ks.get('o', {}), 100)
+    old_ref = layer.get('refId', '')
+    new_ref = id_map.get(old_ref, old_ref) if old_ref else ''
     return {
-        'name': layer.get('nm', 'Unknown'),
-        'ind': layer.get('ind', 0),
-        'layer_type': layer_type,
-        'refId': new_refid,
-        'orig_refId': refId,
-        'position': [p[0] if isinstance(p, list) else 0,
-                     p[1] if isinstance(p, list) else 0,
-                     p[2] if isinstance(p, list) and len(p) > 2 else 0],
-        'anchor': [a[0] if isinstance(a, list) else 0,
-                   a[1] if isinstance(a, list) else 0,
-                   a[2] if isinstance(a, list) and len(a) > 2 else 0],
-        'scale': [s[0] if isinstance(s, list) else s, s[1] if isinstance(s, list) else s, s[2] if isinstance(s, list) and len(s) > 2 else 100],
-        'opacity': o if isinstance(o, (int, float)) else 100,
-        'rotation': r if isinstance(r, (int, float)) else 0,
-        'parent': layer.get('parent'),  # 父级图层 ind
-        'cl': layer.get('cl', ''),       # 混合模式/样式
-        'asset_w': aw,
-        'asset_h': ah,
-        'source_tag': source_tag,
-        'shapes': shapes,    # ty=4 形状层: 原始形状数据
-        'w': lw,            # ty=0 预合成层: 宽高
-        'h': lh,            # ty=0 预合成层: 宽高
+        'ind':    layer.get('ind', 0),
+        'ty':     layer.get('ty', 2),
+        'nm':     layer.get('nm', ''),
+        'refId':  new_ref,
+        'pos':    pos,
+        'anc':    anc,
+        'scl':    scl,
+        'rot':    rot,
+        'opa':    opa,
+        'parent': layer.get('parent'),
+        'bm':     layer.get('bm', 0),
+        'shapes': layer.get('shapes'),
+        'w':      layer.get('w'),
+        'h':      layer.get('h'),
+        'cl':     layer.get('cl'),
+        'tt':     layer.get('tt'),
+        'td':     layer.get('td'),
+        '_sig':   '',
     }
 
-# 提取两个文件的所有图层
-layers_a = [extract_layer_meta(l, 'a') for l in src_a['layers']]
-layers_b = [extract_layer_meta(l, 'b') for l in src_b['layers']]
+layers_a = [extract_layer(l, id_map_a) for l in src_a.get('layers', [])]
+layers_b = [extract_layer(l, id_map_b) for l in src_b.get('layers', [])]
 
-print(f"\n=== 第一个画面 ({len(layers_a)} layers) ===")
-for la in layers_a:
-    print(f"  ind={la['ind']:2d}  {la['name']:20s}  pos=[{la['position'][0]:.0f},{la['position'][1]:.0f}]  anchor=[{la['anchor'][0]:.0f},{la['anchor'][1]:.0f}]  scale=[{la['scale'][0]:.0f}%,{la['scale'][1]:.0f}%]  asset={la['asset_w']}x{la['asset_h']}")
+# 建立 asset 内容签名（图片用 base64 前 80 字符，comp 用 id）
+def get_asset_sig(assets_list, ref_id):
+    for a in assets_list:
+        if a.get('id') == ref_id:
+            if 'layers' in a:
+                return ('comp', ref_id)
+            return ('img', (a.get('p') or '')[:80])
+    return ('?', ref_id)
 
-print(f"\n=== 第二个画面 ({len(layers_b)} layers) ===")
-for lb in layers_b:
-    print(f"  ind={lb['ind']:2d}  {lb['name']:20s}  pos=[{lb['position'][0]:.0f},{lb['position'][1]:.0f}]  anchor=[{lb['anchor'][0]:.0f},{lb['anchor'][1]:.0f}]  scale=[{lb['scale'][0]:.0f}%,{lb['scale'][1]:.0f}%]  asset={lb['asset_w']}x{lb['asset_h']}")
+for l in layers_a:
+    l['_sig'] = get_asset_sig(assets_a, l['refId'])
+for l in layers_b:
+    l['_sig'] = get_asset_sig(assets_b, l['refId'])
 
-# ─── 识别静态图层 ──────────────────────────────────────
-# 同名 + position/anchor/scale 完全相同 = 静态图层
-def layer_same(la, lb):
-    return (
-        la['name'] == lb['name']
-        and la['parent'] == lb['parent']
-        and abs(la['rotation'] - lb['rotation']) < 0.01
-        and abs(la['position'][0] - lb['position'][0]) < 0.1
-        and abs(la['position'][1] - lb['position'][1]) < 0.1
-        and abs(la['anchor'][0] - lb['anchor'][0]) < 0.1
-        and abs(la['anchor'][1] - lb['anchor'][1]) < 0.1
-        and abs(la['scale'][0] - lb['scale'][0]) < 0.1
-        and abs(la['scale'][1] - lb['scale'][1]) < 0.1
-    )
+print("\n=== Layers A ===")
+for l in layers_a:
+    print(f"  ind={l['ind']} ty={l['ty']} nm={repr(l['nm'])} pos=[{l['pos'][0]:.0f},{l['pos'][1]:.0f}] sig={l['_sig'][0]}")
+print("\n=== Layers B ===")
+for l in layers_b:
+    print(f"  ind={l['ind']} ty={l['ty']} nm={repr(l['nm'])} pos=[{l['pos'][0]:.0f},{l['pos'][1]:.0f}] sig={l['_sig'][0]}")
 
-static_layers_a = []  # 场景A中的静态图层
-static_layers_b = []  # 场景B中的静态图层
-fg_layers_a = []      # 场景A中的前景（会动）
-fg_layers_b = []      # 场景B中的前景（会动）
+# ── 识别静态图层：position 相近 AND asset 内容相同 ───────────────────────────
+# 自查点 5: 静态图层识别策略
+# 注意：不依赖图层名（nm），因为 lottielab/AE 导出后 nm 常为空字符串
+# 如果图层名有意义（设计师用 "bg:" "static:" 等前缀命名），可在此处增加名字匹配作为加分项
+def pos_near(pa, pb, tol=2.0):
+    return abs(pa[0] - pb[0]) < tol and abs(pa[1] - pb[1]) < tol
 
-for la in layers_a:
-    is_static = False
-    for lb in layers_b:
-        if layer_same(la, lb):
-            is_static = True
-            # 使用场景A的元数据作为静态图层（去重）
-            static_layers_a.append(la)
-            static_layers_b.append(lb)
-            break
-    if not is_static:
-        fg_layers_a.append(la)
-
-for lb in layers_b:
-    is_static = False
-    for la in layers_a:
-        if layer_same(la, lb):
-            is_static = True
-            break
-    if not is_static:
-        fg_layers_b.append(lb)
-
-print(f"\n=== Static layers ({len(static_layers_a)}) ===")
-for sl in static_layers_a:
-    print(f"  {sl['name']:20s}  pos=[{sl['position'][0]:.0f},{sl['position'][1]:.0f}]  anchor=[{sl['anchor'][0]:.0f},{sl['anchor'][1]:.0f}]")
-
-print(f"\n=== Scene A foreground ({len(fg_layers_a)} layers) ===")
-for fl in fg_layers_a:
-    print(f"  {fl['name']:20s}  pos=[{fl['position'][0]:.0f},{fl['position'][1]:.0f}]  anchor=[{fl['anchor'][0]:.0f},{fl['anchor'][1]:.0f}]")
-
-print(f"\n=== Scene B foreground ({len(fg_layers_b)} layers) ===")
-for fl in fg_layers_b:
-    print(f"  {fl['name']:20s}  pos=[{fl['position'][0]:.0f},{fl['position'][1]:.0f}]  anchor=[{fl['anchor'][0]:.0f},{fl['anchor'][1]:.0f}]")
-
-# ─── 确定入场方向 ──────────────────────────────────────
-def get_entry_direction(x, y):
-    """根据锚点位置推断入场方向"""
-    if y > 500:
-        return "bottom"
-    if x < 400:
-        return "left"
-    if x > 700:
-        return "right"
-    return "center"
-
-for fl in fg_layers_a:
-    fl['direction'] = get_entry_direction(fl['position'][0], fl['position'][1])
-for fl in fg_layers_b:
-    fl['direction'] = get_entry_direction(fl['position'][0], fl['position'][1])
-
-print("\n=== Entry directions ===")
-for fl in fg_layers_a:
-    print(f"  A: {fl['name']:20s} → {fl['direction']}")
-for fl in fg_layers_b:
-    print(f"  B: {fl['name']:20s} → {fl['direction']}")
-
-# ─── 计算飞行距离 ──────────────────────────────────────
-def get_flight_distance(pos_x, pos_y, direction, asset_w, asset_h, anchor_x, anchor_y, scale_x, scale_y):
+def is_same_asset(la, lb):
+    """判断两个图层是否为同一内容（用于识别静态图层）:
+    - 图片类(ty=2): base64 前 80 字符相同
+    - 形状类(ty=4): 位置相同即认为静态
+    - comp类(ty=0): 通常 A/B 文件的 comp 内容不同，不认为相同
     """
-    基于元素视觉边界计算飞行偏移量。
-    visual_left  = pos_x - anchor_x * scale_x
-    visual_top   = pos_y - anchor_y * scale_y
-    visual_right = visual_left + asset_w * scale_x
-    visual_bottom= visual_top  + asset_h * scale_y
-    """
-    vl = pos_x - anchor_x * scale_x
-    vt = pos_y - anchor_y * scale_y
-    vr = vl + asset_w * scale_x
-    vb = vt + asset_h * scale_y
-    
-    margin = 80
+    if la['ty'] == 4 and lb['ty'] == 4:
+        return pos_near(la['pos'], lb['pos'])
+    if la['_sig'][0] == 'img' and lb['_sig'][0] == 'img':
+        return la['_sig'][1] == lb['_sig'][1]
+    return False
 
-    if direction == "left":
-        dx_in = (-margin) - vr  # 视觉右边缘移出左边界
-        return (dx_in, 0), (-dx_in * 0.06, 0)
-    elif direction == "right":
-        dx_in = (CANVAS_W + margin) - vl  # 视觉左边缘移出右边界
-        return (dx_in, 0), (-dx_in * 0.06, 0)
-    elif direction == "bottom":
-        dy_in = (CANVAS_H + margin) - vt  # 视觉上边缘移出下边界
-        return (0, dy_in), (0, -dy_in * 0.06)
-    elif direction == "top":
-        dy_in = (-margin) - vb  # 视觉下边缘移出上边界
-        return (0, dy_in), (0, -dy_in * 0.06)
+static_a, static_b = [], []
+fg_a, fg_b = [], []
+
+matched_b = set()
+for la in layers_a:
+    matched = False
+    for i, lb in enumerate(layers_b):
+        if i in matched_b:
+            continue
+        if pos_near(la['pos'], lb['pos']) and is_same_asset(la, lb):
+            static_a.append(la)
+            static_b.append(lb)
+            matched_b.add(i)
+            matched = True
+            break
+    if not matched:
+        fg_a.append(la)
+
+for i, lb in enumerate(layers_b):
+    if i not in matched_b:
+        fg_b.append(lb)
+
+print(f"\n=== Static ({len(static_a)}) ===")
+for l in static_a:
+    print(f"  {l['nm'] or repr(l['refId'])} pos=[{l['pos'][0]:.0f},{l['pos'][1]:.0f}]")
+print(f"\n=== Scene A FG ({len(fg_a)}) ===")
+for l in fg_a:
+    print(f"  {l['nm'] or repr(l['refId'])} pos=[{l['pos'][0]:.0f},{l['pos'][1]:.0f}]")
+print(f"\n=== Scene B FG ({len(fg_b)}) ===")
+for l in fg_b:
+    print(f"  {l['nm'] or repr(l['refId'])} pos=[{l['pos'][0]:.0f},{l['pos'][1]:.0f}]")
+
+# ── 动效方向 ─────────────────────────────────────────────────────────────────
+# 自查点 6: 阈值基于画布比例，不用绝对像素
+def get_direction(pos):
+    x, y = pos[0], pos[1]
+    if y > H * 0.75: return 'bottom'
+    if x < W * 0.3:  return 'left'
+    if x > W * 0.7:  return 'right'
+    return 'center'
+
+for l in fg_a: l['dir'] = get_direction(l['pos'])
+for l in fg_b: l['dir'] = get_direction(l['pos'])
+
+# ── 缓动曲线 ─────────────────────────────────────────────────────────────────
+EI_OUT = {"x": [0.167], "y": [0.167]}
+EO_OUT = {"x": [0.833], "y": [0.833]}
+EI_IN  = {"x": [0.667], "y": [1.0]}
+EO_IN  = {"x": [0.333], "y": [0.0]}
+
+def kf(t, s, ei=None, eo=None):
+    if ei is None: ei = EI_OUT
+    if eo is None: eo = EO_OUT
+    v = [s] if isinstance(s, (int, float)) else list(s)
+    return {"i": {"x": list(ei["x"]), "y": list(ei["y"])},
+            "o": {"x": list(eo["x"]), "y": list(eo["y"])},
+            "t": t, "s": v}
+
+# ── 飞入/飞出偏移量 ──────────────────────────────────────────────────────────
+def fly_offset(direction, dist=500):
+    """返回画面外的偏移量 (dx, dy)，元素从这个位置飞入"""
+    if direction == 'left':   return (-dist, 0)
+    if direction == 'right':  return ( dist, 0)
+    if direction == 'bottom': return (0,  dist)
+    if direction == 'top':    return (0, -dist)
+    return (0, 0)  # center: 纯淡入淡出
+
+# ── 位置关键帧 ───────────────────────────────────────────────────────────────
+def build_pos_kfs(l, enter_s, enter_e, exit_s, exit_e, initially_visible, stagger=0):
+    x, y, z = l['pos']
+    dx, dy = fly_offset(l['dir'])
+    off_x, off_y = x + dx, y + dy
+    es, ee = enter_s + stagger, enter_e + stagger
+    xs, xe = exit_s, exit_e
+    def p3(px, py): return [px, py, z]
+
+    if l['dir'] == 'center':
+        return None  # center 方向只做透明度，位置不动
+
+    if initially_visible:
+        return sorted([
+            kf(0,  p3(x, y)),
+            kf(xs, p3(x, y),        EI_IN, EO_IN),
+            kf(xe, p3(off_x, off_y)),
+            kf(es, p3(off_x, off_y)),
+            kf(ee, p3(x, y),        EI_IN, EO_IN),
+        ], key=lambda k: k['t'])
     else:
-        return (0, 0), (0, 0)
+        return sorted([
+            kf(0,  p3(off_x, off_y)),
+            kf(es, p3(off_x, off_y)),
+            kf(ee, p3(x, y),        EI_IN, EO_IN),
+            kf(xs, p3(x, y),        EI_IN, EO_IN),
+            kf(xe, p3(off_x, off_y)),
+        ], key=lambda k: k['t'])
 
-# ─── 构建关键帧 ────────────────────────────────────────
-def make_kf(t, value, ei, eo):
-    if isinstance(value, (int, float)):
-        value = [value]
-    return {
-        "i": {"x": ei["x"][:], "y": ei["y"][:]},
-        "o": {"x": eo["x"][:], "y": eo["y"][:]},
-        "t": t,
-        "s": value[:],
+# ── 透明度关键帧 ─────────────────────────────────────────────────────────────
+# 自查点 7: FADE 帧数影响视觉效果，可改为 s2f(0.15) 更安全
+FADE = 8  # 淡入淡出帧数（100fps 下 = 0.08s，30fps 下 = 0.27s）
+
+def build_opa_kfs(enter_s, enter_e, exit_s, exit_e, initially_visible, stagger=0):
+    es = enter_s + stagger
+    xs = exit_s
+    if initially_visible:
+        return sorted([
+            kf(0,        [100]),
+            kf(xs,       [100], EI_IN, EO_IN),
+            kf(xs+FADE,  [0]),
+            kf(es,       [0]),
+            kf(es+FADE,  [100]),
+        ], key=lambda k: k['t'])
+    else:
+        return sorted([
+            kf(0,        [0]),
+            kf(es,       [0]),
+            kf(es+FADE,  [100]),
+            kf(xs,       [100], EI_IN, EO_IN),
+            kf(xs+FADE,  [0]),
+        ], key=lambda k: k['t'])
+
+# ── 构建图层 JSON ─────────────────────────────────────────────────────────────
+out_layers = []
+orig_ind_to_new = {}  # (tag, orig_ind) -> new_ind，用于 parent remap
+
+def _layer_base(l, tag):
+    """构建图层公共字段"""
+    layer = {
+        "ddd": 0,
+        "ty":  l['ty'],
+        "nm":  l['nm'],
+        "sr": 1, "ao": 0, "bm": l.get('bm', 0),
+        "ip": 0, "op": F_TOTAL, "st": 0,
+        "_tag": tag, "_orig_ind": l['ind'],
     }
+    if l['refId']:                          layer['refId'] = l['refId']
+    if l.get('cl'):                         layer['cl'] = l['cl']
+    if l.get('tt') is not None:             layer['tt'] = l['tt']
+    if l.get('td') is not None:             layer['td'] = l['td']
+    if l['ty'] == 4 and l.get('shapes'):   layer['shapes'] = l['shapes']
+    if l['ty'] == 0:
+        if l.get('w'): layer['w'] = l['w']
+        if l.get('h'): layer['h'] = l['h']
+    if l.get('parent') is not None:        layer['parent'] = l['parent']
+    return layer
 
-def build_pos_kfs(fl, delay, entry_start, exit_start, entry_end, exit_end, initial_visible):
-    x, y = fl['position'][0], fl['position'][1]
-    ax, ay = fl['anchor'][0], fl['anchor'][1]
-    sx = fl['scale'][0] / 100.0
-    sy = fl['scale'][1] / 100.0
+def make_static_layer(l, tag):
+    layer = _layer_base(l, tag)
+    layer["ks"] = {
+        "o": {"a": 0, "k": l['opa']},
+        "r": {"a": 0, "k": l['rot']},
+        "p": {"a": 0, "k": l['pos']},
+        "a": {"a": 0, "k": l['anc']},
+        "s": {"a": 0, "k": l['scl']},
+    }
+    return layer
 
-    (dx_in, dy_in), (dx_os, dy_os) = get_flight_distance(
-        x, y, fl['direction'],
-        fl['asset_w'], fl['asset_h'],
-        ax, ay, sx, sy
-    )
+def make_anim_layer(l, tag, enter_s, enter_e, exit_s, exit_e, initially_visible, stagger=0):
+    pos_kfs = build_pos_kfs(l, enter_s, enter_e, exit_s, exit_e, initially_visible, stagger)
+    opa_kfs = build_opa_kfs(enter_s, enter_e, exit_s, exit_e, initially_visible, stagger)
+    layer = _layer_base(l, tag)
+    layer["ks"] = {
+        "o": {"a": 1, "k": opa_kfs},
+        "r": {"a": 0, "k": l['rot']},
+        "p": {"a": 1, "k": pos_kfs} if pos_kfs is not None else {"a": 0, "k": l['pos']},
+        "a": {"a": 0, "k": l['anc']},
+        "s": {"a": 0, "k": l['scl']},
+    }
+    return layer
 
-    entry_x = x + dx_in
-    entry_y = y + dy_in
-    overshoot_x = x + dx_os if fl['direction'] != "center" else x
-    overshoot_y = y + dy_os if fl['direction'] != "center" else y
+# 图层顺序（Lottie 数组首位 = 渲染最上层）:
+#   静态顶层（ind < 5，如腰封）→ B 前景 → A 前景 → 静态底层（如背景）
+# 注意：ind 阈值 5 是基于源文件排列的经验值，如需调整请修改此处
+static_sorted = sorted(static_a, key=lambda l: l['ind'])
+static_top    = [l for l in static_sorted if l['ind'] < 5]
+static_bot    = [l for l in static_sorted if l['ind'] >= 5]
 
-    # Lottie position 必须是3元素 [x, y, z=0]
-    def pos3(px, py): return [px, py, 0]
+for l in static_top:
+    out_layers.append(make_static_layer(l, 'a'))
 
-    kfs = []
+for i, l in enumerate(sorted(fg_b, key=lambda l: l['ind'])):
+    out_layers.append(make_anim_layer(l, 'b',
+        F_B_ENTER_S, F_B_ENTER_E, F_B_EXIT_S, F_B_EXIT_E,
+        initially_visible=False, stagger=i*3))
 
-    # t=0
-    if initial_visible:
-        kfs.append(make_kf(0, pos3(x, y), EASE_OUT, EASE_OUT))
-    else:
-        kfs.append(make_kf(0, pos3(entry_x, entry_y), EASE_OUT, EASE_OUT))
+for i, l in enumerate(sorted(fg_a, key=lambda l: l['ind'])):
+    out_layers.append(make_anim_layer(l, 'a',
+        F_A_ENTER_S, F_A_ENTER_E, F_A_EXIT_S, F_A_EXIT_E,
+        initially_visible=True, stagger=i*3))
 
-    # 退场
-    t_exit_start = exit_start
-    t_exit_end = t_exit_start + 8
-    kfs.append(make_kf(t_exit_start, pos3(x, y), EASE_IN, EASE_OUT))
-    kfs.append(make_kf(t_exit_end, pos3(entry_x, entry_y), EASE_OUT, EASE_OUT))
+for l in static_bot:
+    out_layers.append(make_static_layer(l, 'a'))
 
-    # 入场
-    t_entry = entry_start + delay
-    t_entry_end = t_entry + 8
-    t_bounce = t_entry_end + 6
-    kfs.append(make_kf(t_entry, pos3(entry_x, entry_y), EASE_IN, EASE_OUT))
-    kfs.append(make_kf(t_entry_end, pos3(overshoot_x, overshoot_y), EASE_SNAPPY_I, EASE_SNAPPY_O))
-    kfs.append(make_kf(t_bounce, pos3(x, y), EASE_OUT, EASE_OUT))
+# 编号 + parent remap
+for i, l in enumerate(out_layers):
+    l['ind'] = i + 1
+    orig_ind_to_new[(l['_tag'], l['_orig_ind'])] = i + 1
 
-    kfs.sort(key=lambda kf: kf['t'])
-    return kfs
+for l in out_layers:
+    if l.get('parent') is not None:
+        key = (l['_tag'], l['parent'])
+        if key in orig_ind_to_new:
+            l['parent'] = orig_ind_to_new[key]
+        else:
+            del l['parent']  # 父级未找到时删除，避免错误引用
+    del l['_tag']
+    del l['_orig_ind']
 
-def build_opacity_kfs(entry_start, exit_start, entry_end, exit_end, delay, initial_visible):
-    kfs = []
-    
-    kfs.append(make_kf(0, [100] if initial_visible else [0], EASE_OUT, EASE_OUT))
-    
-    # 退场淡出
-    t_out_start = exit_start
-    t_out_end = t_out_start + 5
-    kfs.append(make_kf(t_out_start, [100], EASE_IN, EASE_IN))
-    kfs.append(make_kf(t_out_end, [0], EASE_IN, EASE_IN))
-    
-    # 入场淡入
-    t_in_start = entry_start + delay
-    t_in_end = t_in_start + 5
-    kfs.append(make_kf(t_in_start, [0], EASE_OUT, EASE_OUT))
-    kfs.append(make_kf(t_in_end, [100], EASE_OUT, EASE_OUT))
-    
-    kfs.sort(key=lambda kf: kf['t'])
-    return kfs
+print(f"\n=== Output layers ({len(out_layers)}) ===")
+for l in out_layers:
+    p_anim = l['ks']['p'].get('a', 0)
+    o_anim = l['ks']['o'].get('a', 0)
+    print(f"  ind={l['ind']} ty={l['ty']} nm={repr(l['nm'])} ref={l.get('refId','-')} p_anim={p_anim} o_anim={o_anim}")
 
-# ─── 为前景图层生成关键帧 ──────────────────────────────
-def build_fg_keyframes(fg_list, entry_start, entry_end, exit_start, exit_end, initial_visible):
-    """为前景图层生成动效关键帧，保留原始 ind 排序"""
-    # 按原始 ind 排序（保持图层前后关系）
-    sorted_fg = sorted(fg_list, key=lambda fl: fl['ind'])
-    
-    # 错帧：同方向元素依次延迟 3 帧
-    dir_delay = {}
-    base_delays = {"left": 0, "right": 1, "bottom": 2, "center": 3, "top": 0}
-    
-    result = []
-    for fl in sorted_fg:
-        d = fl['direction']
-        delay = dir_delay.get(d, base_delays.get(d, 0))
-        dir_delay[d] = delay + 3
-        
-        result.append({
-            'name': fl['name'],
-            'ind': fl['ind'],
-            'refId': fl['refId'],
-            'position': fl['position'],
-            'anchor': fl['anchor'],
-            'scale': fl['scale'],
-            'direction': fl['direction'],
-            'layer_type': fl['layer_type'],
-            'rotation': fl['rotation'],
-            'parent': fl['parent'],
-            'cl': fl['cl'],
-            'source_tag': fl['source_tag'],
-            'delay': delay,
-            'pos_kfs': build_pos_kfs(fl, delay, entry_start, exit_start, entry_end, exit_end, initial_visible),
-            'opacity_kfs': build_opacity_kfs(entry_start, exit_start, entry_end, exit_end, delay, initial_visible),
-            'shapes': fl.get('shapes'),   # ty=4 形状层
-            'w': fl.get('w'),             # ty=0 预合成层
-            'h': fl.get('h'),             # ty=0 预合成层
-        })
-    return result
+# ── 自查点 3: 引用完整性验证 ──────────────────────────────────────────────────
+asset_ids = {a['id'] for a in all_assets}
+bad_refs = [(l.get('nm'), l.get('refId')) for l in out_layers if l.get('refId') and l['refId'] not in asset_ids]
+if bad_refs:
+    print(f"\n⚠️  Missing refIds: {bad_refs}")
+else:
+    print("\n✅ All refIds valid")
 
-scene_a_kfs = build_fg_keyframes(fg_layers_a,
-    SCENE_A_ENTRY_START, SCENE_A_ENTRY_END,
-    SCENE_A_EXIT_START, SCENE_A_EXIT_END,
-    initial_visible=True)
-
-scene_b_kfs = build_fg_keyframes(fg_layers_b,
-    SCENE_B_ENTRY_START, SCENE_B_ENTRY_END,
-    SCENE_B_EXIT_START, SCENE_B_EXIT_END,
-    initial_visible=False)
-
-# ─── 构建输出 Lottie JSON ──────────────────────────────
+# ── 输出 ──────────────────────────────────────────────────────────────────────
 output = {
-    "v": "5.6.10",
-    "fr": FPS,
-    "ip": 0,
-    "op": TOTAL_FRAMES,
-    "w": CANVAS_W,
-    "h": CANVAS_H,
-    "nm": "Merged Animation V3",
-    "ddd": 0,
-    "assets": assets,
-    "layers": []
+    "v":    V,        # 自查点 1: 源文件版本号
+    "fr":   FPS,      # 自查点 2: 源文件帧率
+    "ip":   0,
+    "op":   F_TOTAL,
+    "w":    W,
+    "h":    H,
+    "nm":   "Merged",
+    "ddd":  0,
+    "assets": all_assets,
+    "layers": out_layers,
 }
 
-def make_layer(el, animated=True):
-    """构造 Lottie 图层"""
-    # rotation：有动画的图层保留原始旋转值，没有的取 meta 中的 rotation
-    rot = el.get('rotation', 0)
-    # cl 属性（混合模式）
-    cl = el.get('cl', '')
-    # parent（先保留原始值，后续 remap）
-    parent = el.get('parent')
-    # 保存原始 ind（用于后续 parent remap）
-    source_ind = el['ind']
-    source_tag = el.get('source_tag', '')
-    refId = el.get('refId', '')
-    
-    base = {
-        "ddd": 0,
-        "ind": len(output['layers']),  # 临时值，后面重新编号
-        "ty": el['layer_type'],
-        "nm": el['name'],
-        "sr": 1,
-        "ao": 0,
-        "ip": 0,
-        "op": TOTAL_FRAMES,
-        "st": 0,
-        "bm": 0,
-        "_source_tag": source_tag,
-        "_source_ind": source_ind,  # 内部标记，后续 remap 后删除
-    }
-    
-    # 图像图层(ty=2)和预合成图层(ty=0)都需要 refId
-    if el['layer_type'] in (0, 2) and refId:
-        base["refId"] = refId
-    
-    if cl:
-        base["cl"] = cl
-    if parent is not None:
-        base["parent"] = parent  # 后面在 ind 重新编号后再 remap
-
-    # ty=4 形状层: 必须保留 shapes 数据
-    if el['layer_type'] == 4 and el.get('shapes'):
-        base["shapes"] = el['shapes']
-
-    # ty=0 预合成层: 必须保留 w/h
-    if el['layer_type'] == 0:
-        if el.get('w') is not None:
-            base["w"] = el['w']
-        if el.get('h') is not None:
-            base["h"] = el['h']
-
-    if animated:
-        base["ks"] = {
-            "o": {"a": 1, "k": el['opacity_kfs']},
-            "r": {"a": 0, "k": rot},
-            "p": {"a": 1, "k": el['pos_kfs']},
-            "a": {"a": 0, "k": [el['anchor'][0], el['anchor'][1], 0]},
-            "s": {"a": 0, "k": el['scale']},
-        }
-    else:
-        base["ks"] = {
-            "o": {"a": 0, "k": el['opacity']},
-            "r": {"a": 0, "k": rot},
-            "p": {"a": 0, "k": [el['position'][0], el['position'][1], 0]},
-            "a": {"a": 0, "k": [el['anchor'][0], el['anchor'][1], 0]},
-            "s": {"a": 0, "k": el['scale']},
-        }
-    return base
-
-# 图层排列顺序（Lottie 数组首位 = 渲染最上层）：
-#   [0..n_static_top-1]  顶层静态图层（如腰封）— 永远最上层
-#   [n_static_top..]     Scene B 前景 — B 盖住 A
-#   [...]                Scene A 前景
-#   [..., last]          底层静态图层（背景）— 永远最底层
-
-# 静态图层按 ind 分：ind 小的在上层
-static_sorted = sorted(static_layers_a, key=lambda sl: sl['ind'])
-
-# 腰封类（ind 最小 = 顶层）vs 背景类（ind 最大 = 底层）
-# 腰封 ind=1, 背景 ind=10/9
-static_top = [sl for sl in static_sorted if sl['ind'] < 5]
-static_bottom = [sl for sl in static_sorted if sl['ind'] >= 5]
-
-print(f"\n=== Layer ordering ===")
-print(f"  Static top ({len(static_top)}): {[s['name'] for s in static_top]}")
-print(f"  Scene B FG ({len(scene_b_kfs)}): {[s['name'] for s in scene_b_kfs]}")
-print(f"  Scene A FG ({len(scene_a_kfs)}): {[s['name'] for s in scene_a_kfs]}")
-print(f"  Static bottom ({len(static_bottom)}): {[s['name'] for s in static_bottom]}")
-
-# 1. 顶层静态
-for sl in static_top:
-    output['layers'].append(make_layer(sl, animated=False))
-
-# 2. Scene B 前景（按原始 ind 排序）
-for el in sorted(scene_b_kfs, key=lambda e: e['ind']):
-    output['layers'].append(make_layer(el, animated=True))
-
-# 3. Scene A 前景（按原始 ind 排序）
-for el in sorted(scene_a_kfs, key=lambda e: e['ind']):
-    output['layers'].append(make_layer(el, animated=True))
-
-# 4. 底层静态
-for sl in static_bottom:
-    output['layers'].append(make_layer(sl, animated=False))
-
-# 构建 (source_tag, source_ind) → new_ind 映射（用于 remap parent）
-source_to_new = {}
-for i, l in enumerate(output['layers']):
-    key = (l['_source_tag'], l['_source_ind'])
-    source_to_new[key] = i + 1
-
-# 重新编号 ind 并 remap parent
-for i, l in enumerate(output['layers']):
-    l['ind'] = i + 1
-    # Remap parent
-    if 'parent' in l and l['parent'] is not None:
-        old_parent = l['parent']
-        parent_key = (l['_source_tag'], old_parent)
-        if parent_key in source_to_new:
-            l['parent'] = source_to_new[parent_key]
-            print(f"  parent remap: {l['nm']} parent {old_parent} → {l['parent']}")
-        else:
-            print(f"  ⚠️ Parent remap failed for '{l['nm']}': parent ({l['_source_tag']}, {old_parent}) not found")
-    # 清理内部标记
-    del l['_source_tag']
-    del l['_source_ind']
-
-# ─── 写入文件 ──────────────────────────────────────────
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 with open(OUTPUT, 'w', encoding='utf-8') as f:
     json.dump(output, f, ensure_ascii=False)
 
-print(f"\n✅ 已生成: {OUTPUT}")
-print(f"   总帧数: {TOTAL_FRAMES} ({TOTAL_FRAMES/FPS:.1f}s)")
-print(f"   总图层: {len(output['layers'])} (静态:{len(static_top)+len(static_bottom)} + SceneA:{len(scene_a_kfs)} + SceneB:{len(scene_b_kfs)})")
-print(f"   循环: frame 0 ≈ frame {TOTAL_FRAMES} (Scene A 静置)")
+# ── 生成预览 HTML（含下载按钮）────────────────────────────────────────────────
+PREVIEW = os.path.join(OUTPUT_DIR, 'preview.html')
+with open(OUTPUT, 'r', encoding='utf-8') as f:
+    json_str = f.read()
+
+html = '''<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>Lottie 切换动效预览</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#1a1a2e;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;font-family:-apple-system,sans-serif;color:#eee}
+h2{margin-bottom:16px;font-weight:400;color:#aaa;font-size:16px}
+#lc{width:562px;height:300px;background:#222;border-radius:8px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.4)}
+.ctl{margin-top:20px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;justify-content:center}
+button{padding:8px 20px;border:1px solid #555;border-radius:6px;background:#2a2a4a;color:#eee;cursor:pointer;font-size:14px}
+button:hover{background:#3a3a6a}
+.sp button{background:#222}.sp button.active{background:#5a5aff;border-color:#5a5aff}
+#dl-btn{background:#1a4a2a;border-color:#2a7a4a;color:#7ef5a0}
+#dl-btn:hover{background:#1e5a32}
+#fi,#st{font-size:13px;margin-top:10px;min-height:20px}
+</style></head>
+<body>
+<h2>Lottie 切换动效预览</h2>
+<div id="lc"></div>
+<div class="ctl">
+  <button onclick="anim&&anim.play()">&#9654; 播放</button>
+  <button onclick="anim&&anim.pause()">&#9208; 暂停</button>
+  <button onclick="anim&&anim.goToAndPlay(0,true)">&#8634; 重播</button>
+  <div class="sp">
+    <button onclick="ss(0.5)" id="s05">0.5x</button>
+    <button onclick="ss(1)" id="s10" class="active">1x</button>
+    <button onclick="ss(2)" id="s20">2x</button>
+  </div>
+  <button id="dl-btn" onclick="dlJson()">&#11015; 下载 JSON</button>
+</div>
+<div id="fi"></div>
+<div id="st" style="color:#ff8">加载中...</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/lottie-web/5.12.2/lottie.min.js"></script>
+<script>
+var d=''' + json_str + ''';
+var st=document.getElementById('st'),fi=document.getElementById('fi'),anim=null;
+function ss(s){if(anim)anim.setSpeed(s);document.querySelectorAll('.sp button').forEach(function(b){b.classList.remove('active')});document.getElementById('s'+(s+'').replace('.','0')).classList.add('active')}
+function dlJson(){
+  var blob=new Blob([JSON.stringify(d)],{type:'application/json'});
+  var a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download='merged_output.json';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+function init(){
+  if(typeof lottie==='undefined'){st.style.color='#f88';st.textContent='Lottie库加载失败，请检查网络';return}
+  try{
+    anim=lottie.loadAnimation({container:document.getElementById('lc'),renderer:'svg',loop:true,autoplay:true,animationData:d});
+    anim.addEventListener('enterFrame',function(){fi.textContent='帧: '+Math.round(anim.currentFrame)+' / '+anim.totalFrames});
+    anim.addEventListener('data_ready',function(){st.style.color='#8f8';st.textContent='✅ 加载完成，正在播放...'});
+    anim.addEventListener('data_failed',function(){st.style.color='#f88';st.textContent='❌ 数据解析失败'});
+    anim.addEventListener('error',function(e){st.style.color='#f88';st.textContent='渲染错误: '+JSON.stringify(e)});
+  }catch(e){st.style.color='#f88';st.textContent='初始化失败: '+e.message}
+}
+if(typeof lottie!=='undefined')init();
+else{var c=0,t=setInterval(function(){if(typeof lottie!=='undefined'){clearInterval(t);init()}else if(++c>80){clearInterval(t);st.style.color='#f88';st.textContent='Lottie加载超时，请刷新'}},100)}
+</script>
+</body></html>'''
+
+with open(PREVIEW, 'w', encoding='utf-8') as f:
+    f.write(html)
+
+print(f"\n✅ 输出: {OUTPUT}")
+print(f"   v={V}  fr={FPS}  op={F_TOTAL}  w={W}  h={H}")
+print(f"   layers={len(out_layers)}  assets={len(all_assets)}")
+print(f"✅ 预览: {PREVIEW}")
+print(f"\n━━━ 自查提示 ━━━")
+print(f"1. 用 bejson.com/ui/lottie 验证 JSON 可解析")
+print(f"2. 检查静态图层数量是否合理（预期包含背景图层）")
+print(f"3. 检查 FADE={FADE} 帧在 {FPS}fps 下 = {FADE/FPS:.2f}s，是否过短")
