@@ -20,7 +20,7 @@ Lottie 静帧合并动效 — 分阶段流水线版（V8.1-pipeline）
 中间产物: output/pipeline/00_parse.json, 01_classify.json, 02_timeline.json, 03_keyframes.json
 """
 
-import json, copy, sys, os, argparse, random
+import json, copy, sys, os, argparse
 from copy import deepcopy
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -496,23 +496,6 @@ T_MIN_HOLD  = 0.60           # 最小展示时长 0.6s（入场后至少停留�
 T_FADE_DECO = 0.07           # 装饰类淡入淡出 0.07s
 T_FADE_STD  = 0.10           # 普通/商品类淡入淡出 0.10s
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 展示阶段动效常量（静帧阶段轻微晃动/脉冲）
-# ═══════════════════════════════════════════════════════════════════════════════
-
-T_HOLD_SHAKE_PERIOD = (2.0, 3.0)  # 装饰元素晃动周期 2-3s
-T_HOLD_SHAKE_AMP_PX = (3, 8)      # 位移晃动幅度 3-8px
-T_HOLD_SHAKE_AMP_DEG = (1, 3)     # 旋转晃动幅度 1-3°
-T_HOLD_SHAKE_AMP_SCL = (1, 3)     # 缩放晃动幅度 1-3%（100%→101-103%）
-T_HOLD_PULSE_COUNT = (2, 3)       # 突出元素脉冲次数 2-3 次
-T_HOLD_PULSE_SCALE = (8, 12)      # 突出元素脉冲缩放幅度 8-12%（100%→108-112%）
-T_HOLD_PULSE_PERIOD = (0.4, 0.6)  # 突出元素脉冲周期 0.4-0.6s
-
-# 装饰元素关键词（自动识别）
-DECO_KEYWORDS = ['植物', '沙发', '画画', '气球', '星星', '装饰', 'deco', '氛围', 
-                 '飘带', '光效', '烟花', '花瓣', '雪花', '气泡', 'sparkle', 
-                 'glow', 'particle', 'confetti', ' ribbon', 'garland']
-
 def stage_timeline(classify_out, params=None):
     """Stage 2: 参考动效风格时间轴
     结构：两段式交叉切换 + 首尾空帧循环
@@ -649,61 +632,6 @@ def _is_decoration(nm):
     """判断是否装饰元素（气球/星星等）"""
     keywords = ['气球', '星星', '五角星', 'joy', '星']
     return any(k in nm.lower() for k in keywords)
-
-def _is_decoration_layer(l, W, H, assets=None):
-    """自动识别装饰元素（多层规则，任一满足即判定为装饰元素）
-    
-    规则1: 图层名含装饰关键词（明确匹配）
-    规则2: 图层尺寸小（面积 < 画布面积*3%）且不在中心区域，且不是文字/商品
-    规则3: 形状层（ty=3）且尺寸小，且图层名不含主体关键词
-    """
-    nm = l.get('nm', '').lower()
-    ty = l.get('ty')
-    pos = l.get('pos', [0, 0, 0])
-    
-    # 排除关键词（含这些词的不是装饰元素）
-    exclude_keywords = ['惊喜', '补贴', '领', '标题', '主标', '文案', '利益点', 
-                        'sale', '优惠', '活动', '主题', '艺人', '明星', 'IP']
-    if any(k in nm for k in exclude_keywords):
-        return False
-    
-    # 规则1: 图层名含装饰关键词（明确匹配）
-    if any(k in nm for k in DECO_KEYWORDS):
-        return True
-    
-    # 获取图层尺寸（优先用 aw/ah，否则用 w/h）
-    aw = l.get('aw', l.get('w', 0)) or 0
-    ah = l.get('ah', l.get('h', 0)) or 0
-    
-    # 如果 aw/ah 为 0，尝试从 assets 里获取
-    if (aw == 0 or ah == 0) and assets and l.get('refId'):
-        for a in assets:
-            if a.get('id') == l['refId']:
-                aw = a.get('w', aw) or aw
-                ah = a.get('h', ah) or ah
-                break
-    
-    area = aw * ah
-    canvas_area = W * H
-    is_small = area < canvas_area * 0.03 if area > 0 else False
-    
-    # 规则2: 尺寸小且不在中心区域，且不是文字/商品
-    if is_small:
-        # 计算到中心的距离
-        cx, cy = pos[0], pos[1]
-        dist_to_center = ((cx - W/2)**2 + (cy - H/2)**2)**0.5
-        # 不在中心区域（距离中心 > 画布宽度的 25%）
-        if dist_to_center > W * 0.25:
-            return True
-    
-    # 规则3: 形状层（ty=3）且尺寸小，且图层名不含主体关键词
-    if ty == 3 and is_small:
-        # 排除含主体关键词的形状层
-        main_keywords = ['主体', '人物', '商品', '产品', '标题']
-        if not any(k in nm for k in main_keywords):
-            return True
-    
-    return False
 
 def _kf(t, s, ei=None, eo=None):
     if ei is None: ei = EASE_STD_I
@@ -946,209 +874,6 @@ def stage_keyframes(timeline_out):
         'assets': timeline_out['assets'],
         'timeline_params': timeline_out['timeline_params'],
         'layers': out_layers,
-    }
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Stage 4: 展示阶段动效（静帧阶段轻微晃动/脉冲）
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _insert_hold_shake(kfs, hold_start, hold_end, fps, amp_min, amp_max, is_pos=False):
-    """在关键帧列表的 hold 阶段插入周期性晃动
-    
-    kfs: 关键帧列表（已按 t 排序）
-    hold_start, hold_end: hold 阶段时间范围（帧）
-    fps: 帧率
-    amp_min, amp_max: 晃动幅度范围
-    is_pos: 是否是 position 关键帧（需要 3 元素），否则是 rotation（1 元素）
-    
-    返回: 新的关键帧列表（插入了晃动关键帧）
-    """
-    if hold_end - hold_start < fps * 0.5:  # hold 阶段不足 0.5s，不插入晃动
-        return kfs
-    
-    import random
-    period_s = random.uniform(*T_HOLD_SHAKE_PERIOD)
-    period_f = _s2f(period_s, fps)
-    
-    # 如果周期比 hold 阶段长，缩短周期或只插入一个周期的晃动
-    hold_dur = hold_end - hold_start
-    if period_f > hold_dur:
-        period_f = max(4, hold_dur // 2)  # 至少插入半个周期的晃动
-    
-    new_kfs = []
-    # 找到 hold_start 和 hold_end 在 kfs 中的位置
-    hold_start_idx = -1
-    hold_end_idx = -1
-    for i, kf in enumerate(kfs):
-        if kf['t'] <= hold_start:
-            hold_start_idx = i
-        if kf['t'] >= hold_end:
-            hold_end_idx = i
-            break
-    
-    if hold_start_idx < 0 or hold_end_idx < 0:
-        return kfs
-    
-    # 在 hold_start 和 hold_end 之间插入晃动关键帧
-    t = hold_start
-    while t < hold_end - period_f:
-        # 随机晃动幅度
-        amp = random.uniform(amp_min, amp_max)
-        # 晃动方向随机
-        sign = random.choice([-1, 1])
-        amp_val = amp * sign
-        
-        # 在当前位置和偏移位置之间切换
-        if is_pos:
-            # position 关键帧：s 是 [x, y, z]
-            base_s = kfs[hold_start_idx]['s']
-            shake_s = [base_s[0] + amp_val, base_s[1] + amp_val * 0.5, base_s[2]]
-            new_kfs.append(_kf(int(t), shake_s, EASE_STD_I, EASE_STD_O))
-            new_kfs.append(_kf(int(t + period_f / 2), base_s, EASE_STD_I, EASE_STD_O))
-        else:
-            # rotation 关键帧：s 是 [deg]
-            base_s = kfs[hold_start_idx]['s']
-            shake_s = [base_s[0] + amp_val]
-            new_kfs.append(_kf(int(t), shake_s, EASE_STD_I, EASE_STD_O))
-            new_kfs.append(_kf(int(t + period_f / 2), base_s, EASE_STD_I, EASE_STD_O))
-        
-        t += period_f
-    
-    # 合并关键帧：保持 t 严格递增
-    merged = []
-    seen_t = set()
-    for kf in kfs + new_kfs:
-        if kf['t'] not in seen_t:
-            seen_t.add(kf['t'])
-            merged.append(kf)
-    
-    return sorted(merged, key=lambda k: k['t'])
-
-def stage_hold_anim(keyframes_out, timeline_out, highlight_layers=None):
-    """Stage 4: 展示阶段动效
-    
-    为装饰元素加入持续轻微晃动，为突出元素加入脉冲式动效
-    """
-    meta = keyframes_out['meta']
-    fps = meta['fr']
-    W, H = meta['w'], meta['h']
-    assets = keyframes_out.get('assets', [])
-    
-    # 识别装饰元素
-    deco_layers = []
-    for item in timeline_out['a_timeline'] + timeline_out['b_timeline']:
-        l = item['layer']
-        if _is_decoration_layer(l, W, H, assets):
-            deco_layers.append(l)
-    
-    # 识别突出元素（用户指定）
-    highlight_set = set()
-    if highlight_layers:
-        for nm in highlight_layers:
-            highlight_set.add(nm.lower())
-    
-    print(f"  [Stage 4] 识别到 {len(deco_layers)} 个装饰元素，将加入持续晃动动效")
-    for l in deco_layers:
-        print(f"    - {l['nm']}")
-    
-    if highlight_set:
-        print(f"  [Stage 4] 突出元素: {highlight_layers}")
-    
-    # 为每个动画层加入展示阶段动效
-    out_layers = []
-    for layer in keyframes_out['layers']:
-        tag = layer.get('_tag')
-        orig_ind = layer.get('_orig_ind')
-        nm = layer.get('nm', '')
-        
-        # 找到对应的 timeline item（获取 hold_start/hold_end）
-        timeline_item = None
-        for item in timeline_out['a_timeline'] + timeline_out['b_timeline']:
-            if item['layer']['ind'] == orig_ind:
-                timeline_item = item
-                break
-        
-        if not timeline_item:
-            out_layers.append(layer)
-            continue
-        
-        hold_start = timeline_item['in_end']
-        hold_end = timeline_item['out_start']
-        
-        # 装饰元素：加入持续晃动
-        if any(l['ind'] == orig_ind for l in deco_layers):
-            # position 晃动
-            if layer['ks'].get('p', {}).get('a') == 1:
-                kfs = layer['ks']['p']['k']
-                amp_px = random.uniform(*T_HOLD_SHAKE_AMP_PX)
-                layer['ks']['p']['k'] = _insert_hold_shake(kfs, hold_start, hold_end, fps, amp_px, amp_px, is_pos=True)
-            
-            # rotation 晃动（50% 概率）
-            if random.random() > 0.5 and layer['ks'].get('r', {}).get('a') == 1:
-                kfs = layer['ks']['r']['k']
-                amp_deg = random.uniform(*T_HOLD_SHAKE_AMP_DEG)
-                layer['ks']['r']['k'] = _insert_hold_shake(kfs, hold_start, hold_end, fps, amp_deg, amp_deg, is_pos=False)
-        
-        # 突出元素：加入脉冲动效
-        if nm.lower() in highlight_set:
-            # scale 脉冲
-            if layer['ks'].get('s', {}).get('a') == 0:
-                # scale 是静态的，需要改成动画
-                base_s = layer['ks']['s']['k']
-                pulse_count = random.randint(*T_HOLD_PULSE_COUNT)
-                pulse_amp = random.uniform(*T_HOLD_PULSE_SCALE)
-                pulse_period = random.uniform(*T_HOLD_PULSE_PERIOD)
-                pulse_f = _s2f(pulse_period, fps)
-                
-                scl_kfs = []
-                scl_kfs.append(_kf(0, base_s, EASE_STD_I, EASE_STD_O))
-                for i in range(pulse_count):
-                    t_mid = hold_start + i * pulse_f * 2 + pulse_f
-                    t_end = hold_start + i * pulse_f * 2 + pulse_f * 2
-                    if t_end > hold_end:
-                        break
-                    pulse_s = [base_s[0] + pulse_amp, base_s[1] + pulse_amp, base_s[2]]
-                    scl_kfs.append(_kf(int(t_mid), pulse_s, EASE_STD_I, EASE_STD_O))
-                    scl_kfs.append(_kf(int(t_end), base_s, EASE_STD_I, EASE_STD_O))
-                
-                layer['ks']['s'] = {'a': 1, 'k': scl_kfs}
-            elif layer['ks'].get('s', {}).get('a') == 1:
-                # scale 已经是动画，在 hold 阶段插入脉冲
-                kfs = layer['ks']['s']['k']
-                base_s = kfs[0]['s']
-                pulse_count = random.randint(*T_HOLD_PULSE_COUNT)
-                pulse_amp = random.uniform(*T_HOLD_PULSE_SCALE)
-                pulse_period = random.uniform(*T_HOLD_PULSE_PERIOD)
-                pulse_f = _s2f(pulse_period, fps)
-                
-                new_kfs = []
-                for i in range(pulse_count):
-                    t_mid = hold_start + i * pulse_f * 2 + pulse_f
-                    t_end = hold_start + i * pulse_f * 2 + pulse_f * 2
-                    if t_end > hold_end:
-                        break
-                    pulse_s = [base_s[0] + pulse_amp, base_s[1] + pulse_amp, base_s[2]]
-                    new_kfs.append(_kf(int(t_mid), pulse_s, EASE_STD_I, EASE_STD_O))
-                    new_kfs.append(_kf(int(t_end), base_s, EASE_STD_I, EASE_STD_O))
-                
-                # 合并关键帧
-                merged = []
-                seen_t = set()
-                for kf in kfs + new_kfs:
-                    if kf['t'] not in seen_t:
-                        seen_t.add(kf['t'])
-                        merged.append(kf)
-                layer['ks']['s']['k'] = sorted(merged, key=lambda k: k['t'])
-        
-        out_layers.append(layer)
-    
-    return {
-        'meta': meta,
-        'assets': keyframes_out['assets'],
-        'timeline_params': keyframes_out['timeline_params'],
-        'layers': out_layers,
-        'deco_layers': [l['nm'] for l in deco_layers],
-        'highlight_layers': highlight_layers or [],
     }
 
 def _layer_base(l, tag, F_TOTAL):
@@ -1452,21 +1177,10 @@ STAGE_FILES = {
     1: 'pipeline/01_classify.json',
     2: 'pipeline/02_timeline.json',
     3: 'pipeline/03_keyframes.json',
-    4: 'pipeline/04_hold_anim.json',
 }
 
-def run_pipeline(file_a, file_b, output_dir, from_stage=0, to_stage=6, timeline_params=None, highlight_layers=None):
-    """运行流水线，支持局部重跑
-    
-    Stages:
-      0: Parse — 读取输入文件
-      1: Classify — 静态识别 + 前景分组
-      2: Timeline — 时间轴分配
-      3: Keyframes — 关键帧生成（入场+退场）
-      4: Hold Anim — 展示阶段动效（晃动/脉冲）
-      5: Assemble — 组装输出 JSON
-      6: Preview — 生成预览页
-    """
+def run_pipeline(file_a, file_b, output_dir, from_stage=0, to_stage=5, timeline_params=None):
+    """运行流水线，支持局部重跑"""
     os.makedirs(output_dir, exist_ok=True)
     pipe_dir = os.path.join(output_dir, PIPELINE_DIR)
     os.makedirs(pipe_dir, exist_ok=True)
@@ -1511,22 +1225,7 @@ def run_pipeline(file_a, file_b, output_dir, from_stage=0, to_stage=6, timeline_
 
     # ── Stage 4 ──
     if from_stage <= 4 <= to_stage:
-        hold_out = stage_hold_anim(keyframes_out, timeline_out, highlight_layers)
-        _write_json(os.path.join(output_dir, STAGE_FILES[4]), hold_out)
-        # 写入装饰元素信息（供预览页显示）
-        hold_info = {
-            'deco_layers': hold_out['deco_layers'],
-            'highlight_layers': hold_out['highlight_layers'],
-        }
-        _write_json(os.path.join(output_dir, 'pipeline', 'hold_anim_info.json'), hold_info)
-        print(f"✅ [Stage 4] 展示阶段动效: {len(hold_out['deco_layers'])} 个装饰元素, {len(hold_out['highlight_layers'])} 个突出元素")
-    else:
-        hold_out = _read_json(os.path.join(output_dir, STAGE_FILES[4]))
-        print(f"⏭️  [Stage 4] 复用 {STAGE_FILES[4]}")
-
-    # ── Stage 5 ──
-    if from_stage <= 5 <= to_stage:
-        output, loop_fixed = stage_assemble(hold_out)
+        output, loop_fixed = stage_assemble(keyframes_out)
         stage_assemble_check(output, loop_fixed)
         output_path = os.path.join(output_dir, 'merged_output.json')
         with open(output_path, 'w', encoding='utf-8') as f:
@@ -1535,10 +1234,10 @@ def run_pipeline(file_a, file_b, output_dir, from_stage=0, to_stage=6, timeline_
     else:
         output_path = os.path.join(output_dir, 'merged_output.json')
         output = _read_json(output_path)
-        print(f"⏭️  [Stage 5] 复用 {output_path}")
+        print(f"⏭️  [Stage 4] 复用 {output_path}")
 
-    # ── Stage 6 ──
-    if from_stage <= 6 <= to_stage:
+    # ── Stage 5 ──
+    if from_stage <= 5 <= to_stage:
         preview_fetch, preview_embedded = stage_preview(output, output_dir)
         stage_preview_check(preview_fetch, preview_embedded)
         print(f"✅ 预览(fetch): {preview_fetch}")
@@ -1552,15 +1251,9 @@ def main():
     parser.add_argument('file_a', nargs='?', help='场景 A JSON（全跑模式必需，局部重跑可省略）')
     parser.add_argument('file_b', nargs='?', help='场景 B JSON（全跑模式必需，局部重跑可省略）')
     parser.add_argument('output_dir', nargs='?', default='./output', help='输出目录')
-    parser.add_argument('--from', dest='from_stage', type=int, default=0, help='从哪个阶段开始 (0-6)')
-    parser.add_argument('--to', dest='to_stage', type=int, default=6, help='到哪个阶段结束 (0-6)')
-    parser.add_argument('--highlight', type=str, default=None, help='突出元素图层名（逗号分隔），将加入脉冲动效')
+    parser.add_argument('--from', dest='from_stage', type=int, default=0, help='从哪个阶段开始 (0-5)')
+    parser.add_argument('--to', dest='to_stage', type=int, default=5, help='到哪个阶段结束 (0-5)')
     args = parser.parse_args()
-
-    # 解析 highlight 参数
-    highlight_layers = None
-    if args.highlight:
-        highlight_layers = [nm.strip() for nm in args.highlight.split(',')]
 
     # 局部重跑模式：from_stage > 0 时，第一个位置参数是 output_dir
     if args.from_stage > 0:
@@ -1574,7 +1267,7 @@ def main():
             parser.error('全跑模式需要 file_a 和 file_b 参数\n  用法: python generate_merged_lottie_pipeline.py a.json b.json output/')
 
     run_pipeline(args.file_a, args.file_b, args.output_dir,
-                 args.from_stage, args.to_stage, highlight_layers=highlight_layers)
+                 args.from_stage, args.to_stage)
 
 if __name__ == '__main__':
     main()
