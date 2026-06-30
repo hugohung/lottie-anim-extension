@@ -501,11 +501,11 @@ T_FADE_STD  = 0.10           # 普通/商品类淡入淡出 0.10s
 T_DECO_LOOP_DUR   = (1.8, 2.8)   # 一圈时长 1.8-2.8s（缓慢）
 T_DECO_LOOP_PTS   = 8            # 每圈采样点数（8点构成不规则环形）
 T_DECO_LOOP_PX    = (4.0, 8.0)   # 环形半径 4-8px（不抢主题）
-T_DECO_LOOP_DEG   = (0.5, 1.5)   # 旋转幅度 ±0.5-1.5°（轻微）
+T_DECO_LOOP_DEG   = (2.0, 3.5)   # 旋转幅度 ±2.0-3.5°（轻微但可见）
 # 突出元素：缩放两下（统一缩放，以图片中心为缩放中心）
 T_HIGHLIGHT_DUR     = (0.20, 0.27) # 每次缩放时长 0.20-0.27s（快50%）
 T_HIGHLIGHT_PAUSE   = (0.13, 0.20) # 缩放间停顿 0.13-0.20s（快50%）
-T_HIGHLIGHT_SCALE   = (1.15, 1.22) # 缩放幅度 115%-122%（更大）
+T_HIGHLIGHT_SCALE   = (1.00, 1.20) # 缩放幅度：从原始大小放大到 120%
 
 def stage_timeline(classify_out, params=None):
     """Stage 2: 参考动效风格时间轴
@@ -1069,7 +1069,7 @@ def _insert_deco_shake(layer, fps, W, H):
         loop_end = min(t + loop_dur, hold_end)
         # 这一圈的基础半径
         base_radius = random.uniform(*T_DECO_LOOP_PX)
-        # 这一圈的旋转幅度
+        # 这一圈的旋转幅度（随机正负方向）
         rot_amp = random.uniform(*T_DECO_LOOP_DEG) * random.choice([-1, 1])
         
         pts = T_DECO_LOOP_PTS
@@ -1078,10 +1078,12 @@ def _insert_deco_shake(layer, fps, W, H):
                 # 起点用原位
                 pt_t = t
                 px, py = base_pos[0], base_pos[1]
+                rot_val = base_rot
             elif i == pts:
                 # 终点回原位
                 pt_t = loop_end
                 px, py = base_pos[0], base_pos[1]
+                rot_val = base_rot
             else:
                 # 中间点：角度递增，半径随机波动
                 frac = i / pts
@@ -1091,13 +1093,12 @@ def _insert_deco_shake(layer, fps, W, H):
                 radius = base_radius * random.uniform(0.6, 1.0)
                 px = base_pos[0] + radius * math.cos(angle)
                 py = base_pos[1] + radius * math.sin(angle) * 0.6  # y 方向压扁
-                # 轻微旋转
-                rot_val = base_rot + rot_amp * math.sin(frac * math.pi)
+                # 旋转：用 sin 让旋转在圈内来回摆动，匀速变化
+                rot_val = base_rot + rot_amp * math.sin(frac * 2 * math.pi)
             
             new_pos_kfs.append(_kf(int(pt_t), [px, py, base_pos[2]], EASE_LINEAR_I, EASE_LINEAR_O))
-            
-            if i > 0 and i < pts:
-                new_rot_kfs.append(_kf(int(pt_t), [base_rot + rot_amp * math.sin(frac * math.pi)], EASE_LINEAR_I, EASE_LINEAR_O))
+            # 每个点都添加旋转关键帧，让旋转持续匀速变化
+            new_rot_kfs.append(_kf(int(pt_t), [rot_val], EASE_LINEAR_I, EASE_LINEAR_O))
         
         t = loop_end
         loop_count += 1
@@ -1325,16 +1326,18 @@ def _build_preview_html(mode, json_str=None):
         else:
             size_str = f'{size_bytes / 1024:.0f} KB'
         json_line = f'var jsonData = {json_str};\nwindow.__JSON_SIZE__ = "{size_str}";'
+        # embedded 版本引用本地 JS 文件（无需联网）
+        lib_scripts = '<script src="lottie.min.js"></script>\n<script src="FileSaver.min.js"></script>'
         bootstrap = """st.textContent = 'Lottie库加载中...';
-loadCdn(function(err) {
-  if (err) { st.style.color = '#f88'; st.textContent = '❌ Lottie库加载失败: ' + err.message; return; }
-  if (typeof lottie === 'undefined') { st.style.color = '#f88'; st.textContent = '❌ Lottie对象未定义'; return; }
+setTimeout(function() {
+  if (typeof lottie === 'undefined') { st.style.color = '#f88'; st.textContent = '❌ Lottie库未加载，请确保 lottie.min.js 在同一目录'; return; }
   initAnimation();
-  loadFileSaver(function() {});
-});"""
+}, 50);"""
     else:
         title = 'Lottie 切换动效预览'
         json_line = 'var jsonData = null;\nwindow.__JSON_SIZE__ = "";'
+        # fetch 版本不内嵌本地库，继续使用 CDN 加载
+        lib_scripts = ''
         bootstrap = """var ts = new Date().getTime();
 st.textContent = '正在加载动画数据...';
 fetch('merged_output.json?t=' + ts)
@@ -1389,6 +1392,7 @@ button:hover{background:#3a3a6a}
 </div>
 <div id="fi"></div>
 <div id="st" style="color:#ff8">加载中...</div>
+__LIB_SCRIPTS__
 <script>
 var st = document.getElementById('st');
 var fi = document.getElementById('fi');
@@ -1423,19 +1427,35 @@ function initAnimation() {
 
 __BOOTSTRAP__
 </script>
-</body></html>'''.replace('__TITLE__', title).replace('__JSON_LINE__', json_line).replace('__BOOTSTRAP__', bootstrap)
+</body></html>'''.replace('__TITLE__', title).replace('__JSON_LINE__', json_line).replace('__BOOTSTRAP__', bootstrap).replace('__LIB_SCRIPTS__', lib_scripts)
 
 def stage_preview(output, output_dir):
-    """Stage 5: 生成 fetch + embedded 预览"""
+    """Stage 5: 生成 fetch + embedded 预览
+    embedded 版本引用本地 lottie.min.js 和 FileSaver.min.js，避免 CDN 失败导致无法预览
+    """
     preview_fetch = os.path.join(output_dir, 'preview.html')
     preview_embedded = os.path.join(output_dir, 'preview_embedded.html')
     json_str = json.dumps(output, ensure_ascii=False, separators=(',', ':'))
-
+    
+    # 下载依赖库到本地，供 embedded 版本引用（无需联网）
+    libs = {
+        'lottie.min.js': 'https://cdn.jsdelivr.net/npm/lottie-web@5.12.2/build/player/lottie.min.js',
+        'FileSaver.min.js': 'https://cdn.jsdelivr.net/npm/file-saver@2.0.5/dist/FileSaver.min.js',
+    }
+    for filename, url in libs.items():
+        local_path = os.path.join(output_dir, filename)
+        try:
+            import urllib.request
+            urllib.request.urlretrieve(url, local_path)
+            print(f"  已下载 {filename}")
+        except Exception as e:
+            print(f"  ⚠️ 下载 {filename} 失败: {e}")
+    
     with open(preview_fetch, 'w', encoding='utf-8') as f:
         f.write(_build_preview_html('fetch'))
     with open(preview_embedded, 'w', encoding='utf-8') as f:
         f.write(_build_preview_html('embedded', json_str))
-
+    
     return preview_fetch, preview_embedded
 
 def stage_preview_check(preview_fetch, preview_embedded):
@@ -1445,8 +1465,7 @@ def stage_preview_check(preview_fetch, preview_embedded):
             content = f.read()
         checks = {
             'saveAs调用': 'saveAs(blob' in content,
-            'FileSaver CDN': 'file-saver' in content,
-            'loadFileSaver函数': 'function loadFileSaver' in content,
+            'FileSaver引用': 'FileSaver' in content,
             '降级方案': 'URL.createObjectURL' in content,
             'JSON大小显示': '__JSON_SIZE__' in content,
         }

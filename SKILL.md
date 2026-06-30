@@ -22,19 +22,23 @@ trigger:
 ## 快速执行
 
 ```bash
-# 基本用法（自动识别装饰元素并加入晃动）
+# 基本用法（无展示阶段动效）
 python scripts/generate_merged_lottie_pipeline.py <场景A.json> <场景B.json> [输出目录]
 
-# 指定突出元素（加入脉冲动效）
-python scripts/generate_merged_lottie_pipeline.py a.json b.json output/ --highlight "惊喜日.png,sale.png"
+# 指定装饰元素（持续环形晃动+旋转）
+python scripts/generate_merged_lottie_pipeline.py a.json b.json output/ --deco A_8,A_9
+
+# 指定装饰+突出元素（缩放两下）
+python scripts/generate_merged_lottie_pipeline.py a.json b.json output/ --deco A_8,A_9,B_5,B_8 --highlight A_5:scale,B_4:scale
 ```
 
 **必须遵守的规则：**
 1. **Python 路径**：用 `C:\Users\honghaoxiang\.workbuddy\binaries\python\versions\3.13.12\python.exe`
 2. **输出目录默认值**：不传第三个参数时，输出到 `./output`
-3. **运行后**：脚本自动生成预览 + 自检，无需额外操作
+3. **运行后**：脚本自动下载 `lottie.min.js` + `FileSaver.min.js` 到输出目录，生成预览+自检
 4. **fps 不一致处理**：两个源文件 fps 不同时，输出取 `max(A.fps, B.fps)`。源文件是静帧无动画，所有动效时长以秒定义按输出 fps 换算，30/60/100fps 下视觉节奏完全一致
-5. **突出元素**：通过 `--highlight` 参数指定（逗号分隔的图层名），脚本会自动加入脉冲缩放动效
+5. **`--deco` 参数**：指定装饰元素，格式 `A_8,A_9,B_5,B_8`（A/B 为画面，数字为图层原始索引）
+6. **`--highlight` 参数**：指定突出元素，格式 `A_5:scale,B_4:scale`（type 字段保留但统一只做缩放动画）
 
 ## 分阶段流水线架构（核心）
 
@@ -163,66 +167,95 @@ T_FADE_STD   = 0.10           # 普通/商品类淡入淡出 0.10s
 ## 展示阶段动效（Stage 4）
 
 在元素展示阶段（静帧期）加入轻微晃动或脉冲动效，让头图更生动。
+通过 `--deco` 和 `--highlight` 参数指定，不再自动识别（避免空名图层误伤）。
 
-### 装饰元素识别（自动）
+### 动效模板（V9.4 定稿）
 
-脚本自动识别装饰元素，规则（任一满足即判定为装饰元素）：
+**装饰元素——匀速环形晃动 + 持续轻微旋转**
 
-1. **图层名含装饰关键词**：`植物`/`气球`/`星星`/`装饰`/`deco`/`氛围`/`飘带`/`光效`/`烟花`/`花瓣`/`雪花`/`气泡`等
-2. **尺寸小且不在中心**：面积 < 画布面积*3% 且距离中心 > 画布宽度*25%
-3. **形状层（ty=3）且尺寸小**：且图层名不含主体关键词
+参考 0610.json 中"画画/植物/沙发"图层的运动方式，实现不规则环形路径+线性缓动。
 
-排除规则：图层名含 `惊喜`/`补贴`/`领`/`标题`/`主标`/`文案`/`利益点`/`sale`/`优惠`/`活动`/`主题`/`艺人`/`明星`/`IP` 的不判定为装饰元素。
+| 参数 | 常量 | 值 | 说明 |
+|------|------|-----|------|
+| 一圈时长 | T_DECO_LOOP_DUR | 1.8-2.8s | 缓慢匀速 |
+| 每圈点数 | T_DECO_LOOP_PTS | 8 | 8点构成不规则椭圆 |
+| 环形半径 | T_DECO_LOOP_PX | 4-8px | 不抢主题 |
+| 旋转幅度 | T_DECO_LOOP_DEG | ±2.0-3.5° | 随圈匀速摆动 |
+| 缓动 | - | 线性（EASE_LINEAR） | 无速率曲线，匀速运动 |
 
-### 动效类型
+每个装饰元素在 hold 阶段持续做环形运动，每圈角度偏移随机，每点半径随机波动，
+每圈方向随机（正/反），y 方向压扁 0.6 倍形成椭圆。
 
-| 类型 | 目标元素 | 动效 | 幅度 | 周期 |
-|------|---------|------|------|------|
-| 持续晃动 | 装饰元素（自动识别） | position ±3-8px + rotation ±1-3° | 小 | 2-3s 随机 |
-| 脉冲动效 | 突出元素（用户指定） | scale 100%→108-112%→100% | 中 | 0.4-0.6s，重复 2-3 次 |
+**突出元素——缩放两下（100%→120%→100%→120%→100%）**
 
-### 用户指定突出元素
+| 参数 | 常量 | 值 | 说明 |
+|------|------|-----|------|
+| 每次时长 | T_HIGHLIGHT_DUR | 0.20-0.27s | 快速缩放 |
+| 停顿时长 | T_HIGHLIGHT_PAUSE | 0.13-0.20s | 缩放间静止 |
+| 缩放幅度 | T_HIGHLIGHT_SCALE | 1.00-1.20 | 从原始大小放大到120% |
 
-通过 `--highlight` 参数指定需要脉冲动效的图层名（逗号分隔）：
+**缩放中心自动修正**：以图片中心为缩放中心，同步偏移 position（公式：`position_offset = (anchor - center) × (base_scale/100) × (f - 1)`），
+避免 anchor 偏心导致的中心偏移。
+
+### 参数说明
 
 ```bash
-python generate_merged_lottie_pipeline.py a.json b.json output/ --highlight "惊喜日.png,sale.png"
+# 装饰元素：格式 A_ind,B_ind（A=画面A, B=画面B, ind=图层原始索引）
+--deco A_8,A_9,B_5,B_8
+
+# 突出元素：格式 A_ind:scale,B_ind:scale
+--highlight A_5:scale,B_4:scale
 ```
 
-脚本运行后会输出识别到的装饰元素列表，可供确认。
+### 智能识别规则
 
-### 时长常量（秒定义，自动适配 fps）
+图层命名规则优先级：
+
+1. **图层名含装饰关键词**（`装饰`/`星星`/`气球`/`joy`/`植物`/`光效`等）→ 自动识别为装饰元素
+2. **图层名含核心/突出关键词**（`核心`/`焦点`/`主推`/`highlight` 等）→ 自动识别为突出元素
+3. **图层名清晰可辨**（含 `商品`/`产品`/`标题`/`人物`/`艺人` 等）→ 不加入任何展示动效
+4. **图层名不规范或为空** → 不自动加入，**以提问形式**询问用户哪些需要装饰/突出动效
+
+提问题时输出候选列表（含 ind/位置/尺寸），供用户参考指定 `--deco` / `--highlight` 参数。
+
+### 时长常量（脚本顶部，秒定义）
 
 ```python
-T_HOLD_SHAKE_PERIOD  = (2.0, 3.0)   # 装饰元素晃动周期 2-3s
-T_HOLD_SHAKE_AMP_PX  = (3, 8)       # 位移晃动幅度 3-8px
-T_HOLD_SHAKE_AMP_DEG = (1, 3)       # 旋转晃动幅度 1-3°
-T_HOLD_PULSE_COUNT   = (2, 3)       # 突出元素脉冲次数 2-3 次
-T_HOLD_PULSE_SCALE   = (8, 12)      # 突出元素脉冲缩放幅度 8-12%
+# 装饰元素
+T_DECO_LOOP_DUR   = (1.8, 2.8)    # 一圈时长
+T_DECO_LOOP_PTS   = 8             # 每圈采样点数
+T_DECO_LOOP_PX    = (4.0, 8.0)    # 环形半径
+T_DECO_LOOP_DEG   = (2.0, 3.5)    # 旋转幅度
+
+# 突出元素
+T_HIGHLIGHT_DUR     = (0.20, 0.27)  # 每次缩放时长
+T_HIGHLIGHT_PAUSE   = (0.13, 0.20)  # 缩放间停顿
+T_HIGHLIGHT_SCALE   = (1.00, 1.20)  # 缩放幅度
 ```
 
 ## 预览模板（固化管理）
 
 ### 两种模式
 
-| 模式 | 文件 | 数据加载 | 使用方式 |
-|------|------|---------|---------|
-| fetch | `preview.html` | `fetch('merged_output.json')` | 需启动 `python -m http.server` |
-| embedded | `preview_embedded.html` | JSON 直接内嵌 | 双击打开，无需服务器 |
+| 模式 | 文件 | 数据加载 | JS依赖 | 使用方式 |
+|------|------|---------|--------|---------|
+| fetch | `preview.html` | `fetch('merged_output.json')` | CDN | 需启动 `python -m http.server` |
+| embedded | `preview_embedded.html` | JSON 直接内嵌 | **本地文件** `lottie.min.js` + `FileSaver.min.js` | 双击打开，无需联网 |
 
 ### 预览功能
 
 - ▶/⏸ 播放/暂停切换
 - 🔄 重播
 - ⏩ 0.5x / 1x / 2x 速度切换
-- 📥 下载 JSON（FileSaver.js `saveAs()` + 双CDN + 降级方案）
+- 📥 下载 JSON（`saveAs` 本地依赖 + 原生 `createObjectURL` 降级方案）
 - 📊 实时帧数 + JSON 文件大小显示（`帧: 75 / 150  |  JSON: 226 KB`，≥1MB 自动切 MB）
 
 ### 模板固化方案
 
 1. **单一模板函数** `build_preview_html(mode, json_str)` — fetch/embedded 共用同一份 CSS+JS
-2. **生成后自检** — 检查 saveAs/FileSaver/loadFileSaver/createObjectURL/__JSON_SIZE__，缺任一项报错退出
-3. **禁止手写预览 HTML** — 必须从脚本生成
+2. **本地依赖** — embedded 版本自动下载 `lottie.min.js` + `FileSaver.min.js` 到输出目录，彻底避免 CDN 失败问题
+3. **生成后自检** — 检查 saveAs/saveAs全局/降级方案/__JSON_SIZE__，缺任一项报错退出
+4. **禁止手写预览 HTML** — 必须从脚本生成
 
 ## 输出物
 
@@ -230,12 +263,15 @@ T_HOLD_PULSE_SCALE   = (8, 12)      # 突出元素脉冲缩放幅度 8-12%
 输出目录/
 ├── merged_output.json          # 合并后的 Lottie 动效文件 ← 最终产物
 ├── preview.html                # 预览（fetch 模式，需 HTTP 服务器）
-├── preview_embedded.html       # 预览（内嵌模式，双击打开）
+├── preview_embedded.html       # 预览（内嵌模式，双击打开，本地依赖）
+├── lottie.min.js               # Lottie 播放器（embedded 依赖，自动下载）
+├── FileSaver.min.js            # 文件保存库（embedded 依赖，自动下载）
 ├── pipeline/                   # 中间产物（可打开检查）
 │   ├── 00_parse.json
 │   ├── 01_classify.json
 │   ├── 02_timeline.json
-│   └── 03_keyframes.json
+│   ├── 03_keyframes.json
+│   └── 04_hold_anim.json
 └── group_config.json           # 人工微调覆盖（可选，L2）
 ```
 
@@ -291,6 +327,7 @@ jd-lottie-anim-extension/
 ├── scripts/
 │   ├── generate_merged_lottie_pipeline.py    # 主脚本（流水线版 V9.4）
 │   ├── generate_merged_lottie.py             # 旧版脚本（V8，保留备用）
+│   ├── generate_merged_lottie_pipeline_v9.4_backup.py  # V9.4 备份
 │   ├── generate_merged_lottie_pipeline_v9.3_backup.py  # V9.3 备份
 │   ├── generate_merged_lottie_pipeline_v9.2_backup.py  # V9.2 备份
 │   ├── generate_merged_lottie_pipeline_v8.1_backup.py  # V8.1 备份
@@ -310,8 +347,9 @@ jd-lottie-anim-extension/
 
 | 版本 | 日期 | 主要变更 |
 |------|------|----------|
-| V9.4 | 2026-06-30 | **展示阶段动效（Stage 4）**：装饰元素自动识别+持续轻微晃动（position±3-8px + rotation±1-3°，周期2-3s）；突出元素脉冲动效（--highlight参数指定，scale 100%→108-112%→100%）；装饰元素识别规则优化（排除关键词+尺寸阈值+形状层判断） |
-| V9.2 | 2026-06-30 | **fps自适应**：所有时长改秒定义按fps换算（修复100fps下节奏太快/蓄力不可见）；**静态识别**：改用asset尺寸(aw/ah)代替base64比对（修复lottielab重导出导致的漏判）；**分组bug**：_auto_group直接设图层属性（修复空名nm做dict key互相覆盖导致所有元素同方向） |
+| V9.4 | 2026-06-30 | **展示阶段动效定稿**：参数化指定 `--deco` 装饰元素和 `--highlight` 突出元素；装饰元素匀速环形晃动+持续旋转（线性缓动，参考0610.json画画/植物）；突出元素缩放两下 100%-120%（以图片中心为缩放中心）；删除自动识别（避免空名误伤），改为提问确认+参数指定；embedded预览改本地依赖（自动下载 lottie.min.js/FileSaver.min.js，无需联网） |
+| V9.3 | 2026-06-30 | **全面fps自适应**：退场蓄力下限max(2帧)改T_WINDUP_MIN秒定义；淡入淡出0.07/0.10硬编码改T_FADE常量；最小展示0.6硬编码改T_MIN_HOLD常量；废弃_calc_stagger_ref改秒定义；30fps+100fps交叉验证节奏一致 |
+| V9.2 | 2026-06-30 | **fps自适应+静态识别修复**：所有时长改秒定义按fps换算（修复100fps下节奏太快/蓄力不可见）；静态识别改用asset尺寸(aw/ah)代替base64比对（修复lottielab重导出导致的漏判）；分组bug修复（空名nm做dict key互相覆盖导致所有元素同方向） |
 | V9.1 | 2026-06-30 | 分阶段流水线架构（6阶段解耦+中间产物+自检+局部重跑）；参考动效风格（两段式交叉+首尾空帧+蓄力+overshoot+bounce+退场蓄力）；L1纯代码分组（语义匹配+空间聚类）+L2人工微调；预览模板固化（单一函数+自检+JSON大小显示） |
 | V8.1 | 2026-06-30 | 预览模板固化：fetch/embedded 合并 build_preview_html()，生成后自检 |
 | V8.0 | 2026-06-29 | 预览优化：toggle按钮、FileSaver.js、回归V6时间轴 |
@@ -342,6 +380,7 @@ jd-lottie-anim-extension/
 
 | 版本 | 备份文件 | 回滚命令 |
 |------|---------|---------|
+| V9.4 流水线 | `generate_merged_lottie_pipeline_v9.4_backup.py` | `cp generate_merged_lottie_pipeline_v9.4_backup.py generate_merged_lottie_pipeline.py` |
 | V9.3 流水线 | `generate_merged_lottie_pipeline_v9.3_backup.py` | `cp generate_merged_lottie_pipeline_v9.3_backup.py generate_merged_lottie_pipeline.py` |
 | V9.2 流水线 | `generate_merged_lottie_pipeline_v9.2_backup.py` | `cp generate_merged_lottie_pipeline_v9.2_backup.py generate_merged_lottie_pipeline.py` |
 | V8.1 流水线 | `generate_merged_lottie_pipeline_v8.1_backup.py` | `cp generate_merged_lottie_pipeline_v8.1_backup.py generate_merged_lottie_pipeline.py` |
