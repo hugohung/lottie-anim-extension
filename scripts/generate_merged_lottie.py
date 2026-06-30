@@ -642,15 +642,72 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 with open(OUTPUT, 'w', encoding='utf-8') as f:
     json.dump(output, f, ensure_ascii=False)
 
-# ── 生成预览 HTML（含下载按钮）────────────────────────────────────────────────
-# 修复：使用 jsdelivr CDN（国内可用）+ fetch 加载 JSON（避免内嵌大文件导致问题）
-# 修复：不用 IIFE，anim/ss/dlJson 必须是全局变量，否则 onclick 访问不到
+# ── 预览 HTML 生成（单一模板，杜绝 fetch/embedded 逻辑漂移）──────────────────────
+# 历史 bug：fetch 版和 embedded 版曾各自维护一份 HTML，导致 FileSaver.js 下载修复
+#   只存在于 fetch 版，embedded 版丢了 saveAs() 逻辑，下载按钮跳转网页。
+# 修复方案：抽出 build_preview_html() 单一函数，两种模式共用同一份 CSS+JS，
+#   仅 jsonData 赋值方式和 bootstrap 流程不同。改一处即同步两版。
 PREVIEW = os.path.join(OUTPUT_DIR, 'preview.html')
+PREVIEW_EMBEDDED = os.path.join(OUTPUT_DIR, 'preview_embedded.html')
+json_str = json.dumps(output, ensure_ascii=False, separators=(',', ':'))
 
-# 注意：不用 f-string，避免 JS 花括号转义混乱
-html = '''<!DOCTYPE html>
+def build_preview_html(mode, json_str=None):
+    """生成预览 HTML。
+    mode='fetch'    — jsonData 从 fetch('merged_output.json') 加载，需 HTTP 服务器
+    mode='embedded' — jsonData 直接内嵌，双击打开即可
+    两种模式共享同一份 CSS + JS（含 FileSaver.js saveAs 下载修复），仅数据加载方式不同。
+    """
+    assert mode in ('fetch', 'embedded'), f'unknown mode: {mode}'
+    if mode == 'embedded':
+        assert json_str is not None, 'embedded 模式需要 json_str'
+        title = 'Lottie 切换动效预览（内嵌模式）'
+        json_line = f'var jsonData = {json_str};'
+        # embedded: 数据已就绪，直接加载 lottie-web → initAnimation → 预加载 FileSaver
+        bootstrap = """st.textContent = 'Lottie库加载中...';
+loadCdn(function(err) {
+  if (err) { st.style.color = '#f88'; st.textContent = '❌ Lottie库加载失败: ' + err.message; return; }
+  if (typeof lottie === 'undefined') { st.style.color = '#f88'; st.textContent = '❌ Lottie对象未定义'; return; }
+  initAnimation();
+  loadFileSaver(function() {});
+});"""
+    else:
+        title = 'Lottie 切换动效预览'
+        json_line = 'var jsonData = null;'
+        # fetch: 先 fetch JSON → 再加载 lottie-web → initAnimation → 预加载 FileSaver
+        bootstrap = """var ts = new Date().getTime();
+st.textContent = '正在加载动画数据...';
+fetch('merged_output.json?t=' + ts)
+  .then(function(r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  })
+  .then(function(d) {
+    jsonData = d;
+    st.textContent = 'Lottie库加载中...';
+    loadCdn(function(err) {
+      if (err) {
+        st.style.color = '#f88';
+        st.textContent = '❌ Lottie库加载失败: ' + err.message + ' (请检查网络或刷新重试)';
+        return;
+      }
+      if (typeof lottie === 'undefined') {
+        st.style.color = '#f88';
+        st.textContent = '❌ Lottie对象未定义';
+        return;
+      }
+      initAnimation();
+      loadFileSaver(function() {});
+    });
+  })
+  .catch(function(err) {
+    st.style.color = '#f88';
+    st.textContent = '❌ 数据加载失败: ' + err.message + ' (需通过 HTTP 服务器打开，不能直接双击)';
+  });"""
+
+    # 单一模板：CSS + HTML body + 共享 JS 函数，只有 {{TITLE}} / {{JSON_LINE}} / {{BOOTSTRAP}} 三个插值点
+    return '''<!DOCTYPE html>
 <html lang="zh-CN">
-<head><meta charset="UTF-8"><title>Lottie 切换动效预览</title>
+<head><meta charset="UTF-8"><title>__TITLE__</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#1a1a2e;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;font-family:-apple-system,sans-serif;color:#eee}
@@ -665,7 +722,7 @@ button:hover{background:#3a3a6a}
 #fi,#st{font-size:13px;margin-top:10px;min-height:20px}
 </style></head>
 <body>
-<h2>Lottie 切换动效预览</h2>
+<h2>__TITLE__</h2>
 <div id="lc"></div>
 <div class="ctl">
   <button onclick="doToggle()" id="btnToggle">&#9208; 暂停</button>
@@ -680,11 +737,11 @@ button:hover{background:#3a3a6a}
 <div id="fi"></div>
 <div id="st" style="color:#ff8">加载中...</div>
 <script>
-// 全局变量（onclick 必须能访问到）
+// 全局变量（onclick 必须能访问到，禁止用 IIFE 包裹）
 var st = document.getElementById('st');
 var fi = document.getElementById('fi');
 var anim = null;
-var jsonData = null;
+__JSON_LINE__
 
 var CDN_URLS = [
   "https://cdn.jsdelivr.net/npm/lottie-web@5.12.2/build/player/lottie.min.js",
@@ -699,25 +756,15 @@ var cdnIdx = 0;
 function doToggle() {
   if (!anim) return;
   var btn = document.getElementById('btnToggle');
-  if (anim.isPaused) {
-    anim.play();
-    btn.innerHTML = '&#9208; 暂停';
-  } else {
-    anim.pause();
-    btn.innerHTML = '&#9654; 播放';
-  }
+  if (anim.isPaused) { anim.play(); btn.innerHTML = '&#9208; 暂停'; }
+  else { anim.pause(); btn.innerHTML = '&#9654; 播放'; }
 }
 function doReplay() {
-  if (anim) {
-    anim.goToAndPlay(0, true);
-    document.getElementById('btnToggle').innerHTML = '&#9208; 暂停';
-  }
+  if (anim) { anim.goToAndPlay(0, true); document.getElementById('btnToggle').innerHTML = '&#9208; 暂停'; }
 }
 function ss(s) {
   if (anim) anim.setSpeed(s);
-  document.querySelectorAll('.sp button').forEach(function(b) {
-    b.classList.remove('active');
-  });
+  document.querySelectorAll('.sp button').forEach(function(b) { b.classList.remove('active'); });
   var btnId = 's' + (s + '').replace('.', '0');
   var btn = document.getElementById(btnId);
   if (btn) btn.classList.add('active');
@@ -725,7 +772,7 @@ function ss(s) {
 function dlJson() {
   if (!jsonData) { alert('JSON 尚未加载完成'); return; }
   var data = JSON.stringify(jsonData, null, 2);
-  // 用 FileSaver.js saveAs() 确保文件名正确（原生 a.download 对 blob URL 可能失效）
+  // 用 FileSaver.js saveAs() 确保文件名正确（原生 a.download 对 blob URL 可能失效，导致跳转网页）
   var blob = new Blob([data], {type: 'application/json;charset=utf-8'});
   if (typeof saveAs === 'function') {
     saveAs(blob, 'merged_output.json');
@@ -733,14 +780,9 @@ function dlJson() {
     // FileSaver 未加载时的降级方案
     var url = URL.createObjectURL(blob);
     var a = document.createElement('a');
-    a.href = url;
-    a.download = 'merged_output.json';
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(function() {
-      if (a.parentNode) document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    }, 2000);
+    a.href = url; a.download = 'merged_output.json';
+    document.body.appendChild(a); a.click();
+    setTimeout(function() { if (a.parentNode) document.body.removeChild(a); URL.revokeObjectURL(url); }, 2000);
   }
 }
 
@@ -750,15 +792,10 @@ function loadCdn(cb) {
   s.onload = function() { cb(null); };
   s.onerror = function() {
     cdnIdx++;
-    if (cdnIdx < CDN_URLS.length) {
-      loadCdn(cb);
-    } else {
-      cb(new Error('所有CDN均失败'));
-    }
+    if (cdnIdx < CDN_URLS.length) { loadCdn(cb); } else { cb(new Error('所有CDN均失败')); }
   };
   document.head.appendChild(s);
 }
-
 function loadFileSaver(cb) {
   var fsIdx = 0;
   function tryNext() {
@@ -767,11 +804,7 @@ function loadFileSaver(cb) {
     s.onload = function() { cb(null); };
     s.onerror = function() {
       fsIdx++;
-      if (fsIdx < FSAVER_URLS.length) {
-        tryNext();
-      } else {
-        cb(new Error('FileSaver CDN 失败（降级使用原生下载）'));
-      }
+      if (fsIdx < FSAVER_URLS.length) { tryNext(); } else { cb(new Error('FileSaver CDN 失败（降级使用原生下载）')); }
     };
     document.head.appendChild(s);
   }
@@ -781,75 +814,51 @@ function loadFileSaver(cb) {
 function initAnimation() {
   try {
     anim = lottie.loadAnimation({
-      container: document.getElementById('lc'),
-      renderer: 'svg',
-      loop: true,
-      autoplay: true,
-      animationData: jsonData
+      container: document.getElementById('lc'), renderer: 'svg', loop: true, autoplay: true, animationData: jsonData
     });
-    anim.addEventListener('enterFrame', function() {
-      fi.textContent = '帧: ' + Math.round(anim.currentFrame) + ' / ' + anim.totalFrames;
-    });
-    anim.addEventListener('data_ready', function() {
-      st.style.color = '#8f8';
-      st.textContent = '✅ 加载完成，正在播放...';
-    });
-    anim.addEventListener('data_failed', function() {
-      st.style.color = '#f88';
-      st.textContent = '❌ 数据解析失败';
-    });
-    anim.addEventListener('error', function(e) {
-      st.style.color = '#f88';
-      st.textContent = '渲染错误: ' + (e.error ? e.error.message : JSON.stringify(e));
-    });
-  } catch(e) {
-    st.style.color = '#f88';
-    st.textContent = '初始化失败: ' + e.message;
-  }
+    anim.addEventListener('enterFrame', function() { fi.textContent = '帧: ' + Math.round(anim.currentFrame) + ' / ' + anim.totalFrames; });
+    anim.addEventListener('data_ready', function() { st.style.color = '#8f8'; st.textContent = '✅ 加载完成，正在播放...'; });
+    anim.addEventListener('data_failed', function() { st.style.color = '#f88'; st.textContent = '❌ 数据解析失败'; });
+    anim.addEventListener('error', function(e) { st.style.color = '#f88'; st.textContent = '渲染错误: ' + (e.error ? e.error.message : JSON.stringify(e)); });
+  } catch(e) { st.style.color = '#f88'; st.textContent = '初始化失败: ' + e.message; }
 }
 
-// 第一步：fetch 加载 JSON（加时间戳破坏浏览器缓存）
-var ts = new Date().getTime();
-st.textContent = '正在加载动画数据...';
-fetch('merged_output.json?t=' + ts)
-  .then(function(r) {
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return r.json();
-  })
-  .then(function(d) {
-    jsonData = d;
-    st.textContent = 'Lottie库加载中...';
-    // 第二步：加载 lottie-web
-    loadCdn(function(err) {
-      if (err) {
-        st.style.color = '#f88';
-        st.textContent = '❌ Lottie库加载失败: ' + err.message + ' (请检查网络或刷新重试)';
-        return;
-      }
-      if (typeof lottie === 'undefined') {
-        st.style.color = '#f88';
-        st.textContent = '❌ Lottie对象未定义';
-        return;
-      }
-      initAnimation();
-      // 预加载 FileSaver.js（下载功能需要）
-      loadFileSaver(function() {});
-    });
-  })
-  .catch(function(err) {
-    st.style.color = '#f88';
-    st.textContent = '❌ 数据加载失败: ' + err.message;
-  });
+__BOOTSTRAP__
 </script>
-</body></html>'''
+</body></html>'''.replace('__TITLE__', title).replace('__JSON_LINE__', json_line).replace('__BOOTSTRAP__', bootstrap)
 
+# 生成 fetch 版（需 HTTP 服务器）
+html_fetch = build_preview_html('fetch')
 with open(PREVIEW, 'w', encoding='utf-8') as f:
-    f.write(html)
+    f.write(html_fetch)
+
+# 生成内嵌版（双击打开，无需服务器）
+html_embedded = build_preview_html('embedded', json_str)
+with open(PREVIEW_EMBEDDED, 'w', encoding='utf-8') as f:
+    f.write(html_embedded)
+
+# ── 预览 HTML 自检（防止 FileSaver 逻辑再次丢失）──────────────────────────────
+for label, path in [('fetch', PREVIEW), ('embedded', PREVIEW_EMBEDDED)]:
+    with open(path, encoding='utf-8') as f:
+        content = f.read()
+    checks = {
+        'saveAs调用': 'saveAs(blob' in content,
+        'FileSaver CDN': 'file-saver' in content,
+        'loadFileSaver函数': 'function loadFileSaver' in content,
+        '降级方案': 'URL.createObjectURL' in content,
+    }
+    failed = [k for k, v in checks.items() if not v]
+    if failed:
+        print(f'❌ 预览自检失败 [{label}]: 缺少 {failed}')
+        sys.exit(1)
+    else:
+        print(f'✅ 预览自检 [{label}]: saveAs + FileSaver + 降级方案 齐全')
 
 print(f"\n✅ 输出: {OUTPUT}")
 print(f"   v={V}  fr={FPS}  op={F_TOTAL}  w={W}  h={H}")
 print(f"   layers={len(out_layers)}  assets={len(all_assets)}")
-print(f"✅ 预览: {PREVIEW}")
+print(f"✅ 预览(fetch): {PREVIEW}  (需启动 http.server)")
+print(f"✅ 预览(内嵌): {PREVIEW_EMBEDDED}  (双击打开，无需服务器)")
 print(f"\n━━━ 自查提示 ━━━")
 print(f"1. 用 bejson.com/ui/lottie 验证 JSON 可解析")
 print(f"2. 检查静态图层数量是否合理（预期包含背景图层）")
